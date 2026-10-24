@@ -233,6 +233,290 @@ def test_host_altering_deadlines_wakes_trio_up() -> None:
     assert trivial_guest_run(trio_main) == "ok"
 
 
+class StepInstrument(Instrument):
+    def __init__(self) -> None:
+        self.steps = 0
+
+    def before_task_step(self, task: trio.lowlevel.Task) -> None:
+        self.steps += 1
+
+
+def start_controlled_guest(
+    trio_fn: Callable[..., Awaitable[T]],
+    *args: object,
+    with_host: bool = False,
+    clock: Clock | None = None,
+    instruments: Sequence[Instrument] = (),
+) -> tuple[
+    trio.lowlevel.GuestRun,
+    queue.Queue[object],
+    list[Outcome[T]],
+]:
+    todo: queue.Queue[object] = queue.Queue()
+    done_outcomes: list[Outcome[T]] = []
+
+    def run_sync_soon(fn: Callable[[], object]) -> None:
+        todo.put(fn)
+
+    def done_callback(outcome: Outcome[T]) -> None:
+        done_outcomes.append(outcome)
+        todo.put(("done", outcome))
+
+    guest_args = (run_sync_soon, *args) if with_host else args
+    handle = trio.lowlevel.start_guest_run(
+        trio_fn,
+        *guest_args,
+        run_sync_soon_threadsafe=run_sync_soon,
+        run_sync_soon_not_threadsafe=run_sync_soon,
+        done_callback=done_callback,
+        clock=clock,
+        instruments=instruments,
+    )
+    return handle, todo, done_outcomes
+
+
+def drain_guest_until_done(
+    handle: trio.lowlevel.GuestRun,
+    todo: queue.Queue[object],
+    instrument: StepInstrument | None = None,
+) -> None:
+    while not handle.finished:
+        if instrument is not None:
+            instrument.steps = 0
+        item = todo.get(timeout=1)
+        if isinstance(item, tuple):
+            assert item[0] == "done"
+            break
+        item()
+        if instrument is not None:
+            assert instrument.steps <= 1
+
+
+def clear_guest_todo(todo: queue.Queue[object]) -> None:
+    while True:
+        try:
+            todo.get_nowait()
+        except queue.Empty:
+            return
+
+
+def test_guest_run_step_quota() -> None:
+    record: list[int] = []
+    instrument = StepInstrument()
+
+    async def trio_main() -> None:
+        for value in range(4):
+            record.append(value)
+            await trio.lowlevel.checkpoint()
+
+    handle, todo, done = start_controlled_guest(
+        trio_main,
+        instruments=(instrument,),
+    )
+    todo.get(timeout=1)  # Replace the unbounded initial callback.
+    instrument.steps = 0
+    handle.run_once(max_steps=1)
+    assert instrument.steps <= 1
+    drain_guest_until_done(handle, todo, instrument)
+
+    assert record == [0, 1, 2, 3]
+    assert len(done) == 1
+    assert done[0].unwrap() is None
+
+
+def test_guest_run_invalid_quota() -> None:
+    async def trio_main() -> None:
+        await trio.lowlevel.checkpoint()
+
+    handle, _, _ = start_controlled_guest(trio_main)
+    with pytest.raises(ValueError, match="max_steps"):
+        handle.run_once(max_steps=0)
+    handle.stop()
+
+
+def test_driver_time_quota(monkeypatch: pytest.MonkeyPatch) -> None:
+    from trio._core import _run
+
+    times = iter([0.0, 0.0, 1.0, 1.0])
+    monkeypatch.setattr(_run, "perf_counter", lambda: next(times))
+
+    driver = _run._Driver()
+    driver.begin(time_limit=1)
+    assert not driver.after_task_step()
+    assert driver.after_task_step()
+
+
+def test_guest_run_pause_resume_keeps_signal_wakeup() -> None:
+    record: list[int | str] = []
+    token: trio.lowlevel.TrioToken | None = None
+
+    async def trio_main() -> None:
+        nonlocal token
+        token = trio.lowlevel.current_trio_token()
+        for value in range(4):
+            record.append(value)
+            await trio.lowlevel.checkpoint()
+
+    handle, todo, done = start_controlled_guest(trio_main)
+    todo.get(timeout=1)
+    handle.run_once(max_steps=1)
+    while [item for item in record if isinstance(item, int)] != [0]:
+        todo.get(timeout=1)()
+
+    clear_guest_todo(todo)
+    handle.pause()
+    assert handle.paused
+    assert token is not None
+    # Signal delivery uses the same EntryQueue + wakeup-fd path.
+    token.run_sync_soon(record.append, "signal", idempotent=True)
+    handle.run_once(max_steps=1)
+    assert record == [0]
+
+    handle.resume(max_steps=1)
+    drain_guest_until_done(handle, todo)
+
+    assert [item for item in record if isinstance(item, int)] == [0, 1, 2, 3]
+    assert record.count("signal") == 1
+    assert len(done) == 1
+    assert done[0].unwrap() is None
+
+
+def test_guest_run_pause_resume_keeps_io_wakeup() -> None:
+    record: list[str] = []
+    ready = threading.Event()
+    a, b = socket.socketpair()
+
+    async def trio_main(in_host: InHost) -> None:
+        in_host(ready.set)
+        await trio.lowlevel.wait_readable(a)
+        record.append("readable")
+
+    handle, todo, done = start_controlled_guest(trio_main, with_host=True)
+    try:
+        while not ready.is_set():
+            todo.get(timeout=1)()
+        clear_guest_todo(todo)
+        handle.pause()
+        b.send(b"x")
+
+        try:
+            event_delivery = todo.get(timeout=1)
+        except queue.Empty:
+            event_delivery = None
+        if event_delivery is not None:
+            event_delivery()
+        assert record == []
+
+        handle.resume()
+        drain_guest_until_done(handle, todo)
+        assert record == ["readable"]
+        assert done[0].unwrap() is None
+    finally:
+        a.close()
+        b.close()
+
+
+def test_guest_run_pause_resume_keeps_thread_result() -> None:
+    record: list[str] = []
+    worker_started = threading.Event()
+
+    def blocking_work() -> str:
+        worker_started.set()
+        time.sleep(0.1)
+        return "thread result"
+
+    async def trio_main() -> None:
+        record.append(await trio.to_thread.run_sync(blocking_work))
+
+    handle, todo, done = start_controlled_guest(trio_main)
+    while not worker_started.is_set():
+        todo.get(timeout=1)()
+    clear_guest_todo(todo)
+
+    handle.pause()
+    thread_delivery = todo.get(timeout=1)
+    thread_delivery()
+    assert record == []
+
+    handle.resume()
+    drain_guest_until_done(handle, todo)
+    assert record == ["thread result"]
+    assert len(done) == 1
+
+
+def test_guest_run_pause_defers_cancellation_checkpoint() -> None:
+    record: list[str] = []
+    ready = threading.Event()
+    clock = trio.testing.MockClock(autojump_threshold=0)
+
+    async def trio_main(in_host: InHost) -> None:
+        in_host(ready.set)
+        with trio.move_on_after(10):
+            await trio.sleep_forever()
+        record.append("cancelled")
+
+    handle, todo, done = start_controlled_guest(
+        trio_main,
+        with_host=True,
+        clock=clock,
+    )
+    while not ready.is_set():
+        todo.get(timeout=1)()
+    clear_guest_todo(todo)
+
+    handle.pause()
+    assert record == []
+
+    handle.resume()
+    drain_guest_until_done(handle, todo)
+    assert record == ["cancelled"]
+    assert done[0].unwrap() is None
+
+
+def test_guest_run_stop_has_conclusion_and_done_callback_once() -> None:
+    async def trio_main() -> None:
+        while True:
+            await trio.lowlevel.checkpoint()
+
+    handle, todo, done = start_controlled_guest(trio_main)
+    todo.get(timeout=1)
+    handle.run_once(max_steps=1)
+    clear_guest_todo(todo)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        handle.stop()
+        gc_collect_harder()
+
+    assert handle.finished
+    assert handle.outcome is not None
+    with pytest.raises(trio.Cancelled):
+        handle.outcome.unwrap()
+    assert len(done) == 1
+    handle.stop()
+    handle.run_once()
+    assert len(done) == 1
+    assert not any(
+        "Trio guest run got abandoned" in str(warning.message) for warning in caught
+    )
+
+
+def test_guest_run_stop_while_waiting_for_io() -> None:
+    async def trio_main() -> None:
+        await trio.sleep_forever()
+
+    handle, todo, done = start_controlled_guest(trio_main)
+    todo.get(timeout=1)()
+    clear_guest_todo(todo)
+
+    handle.stop()
+
+    assert handle.finished
+    with pytest.raises(trio.Cancelled):
+        handle.outcome.unwrap()
+    assert len(done) == 1
+
+
 def test_guest_mode_sniffio_integration() -> None:
     current_async_library = sniffio.current_async_library
     sniffio_library = sniffio.thread_local

@@ -13,6 +13,7 @@ import typing as _t
 # Generally available symbols
 from ._core import (
     Abort as Abort,
+    GuestRun as GuestRun,
     ParkingLot as ParkingLot,
     ParkingLotStatistics as ParkingLotStatistics,
     RaiseCancelT as RaiseCancelT,

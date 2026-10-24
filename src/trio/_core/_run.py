@@ -7,17 +7,19 @@ import itertools
 import random
 import select
 import sys
+import threading
 import warnings
 from collections import deque
 from contextlib import AbstractAsyncContextManager, contextmanager, suppress
 from contextvars import copy_context
 from heapq import heapify, heappop, heappush
-from math import inf, isnan
+from math import inf, isinf, isnan
 from time import perf_counter
 from typing import (
     TYPE_CHECKING,
     Any,
     Final,
+    Generic,
     NoReturn,
     Protocol,
     cast,
@@ -1710,6 +1712,63 @@ class RunStatistics:
     run_sync_soon_queue_size: int
 
 
+# Yielded from unrolled_run when a guest run reaches its step/time quota or is
+# paused. Unlike a timeout yield, this does not require the driver to collect
+# IO events; resuming with None continues at the saved scheduler position.
+_DRIVE_BOUNDARY: Final[object] = object()
+
+
+@attrs.define(eq=False)
+class _Driver:
+    """Shared scheduler state for regular and guest-mode runs."""
+
+    step_limit: int | float = inf
+    step_count: int = 0
+    deadline: float = inf
+    paused: bool = False
+    finished: bool = False
+
+    def begin(
+        self,
+        max_steps: int | None = None,
+        time_limit: float | None = None,
+    ) -> None:
+        if max_steps is None:
+            self.step_limit = inf
+        else:
+            if isinstance(max_steps, bool) or not isinstance(max_steps, int):
+                raise ValueError("max_steps must be a positive integer or None")
+            if max_steps <= 0:
+                raise ValueError("max_steps must be a positive integer or None")
+            self.step_limit = max_steps
+
+        if time_limit is None:
+            self.deadline = inf
+        else:
+            if (
+                isinstance(time_limit, bool)
+                or not isinstance(time_limit, (int, float))
+                or isnan(time_limit)
+                or time_limit <= 0
+            ):
+                raise ValueError("time_limit must be a positive number or None")
+            self.deadline = inf if isinf(time_limit) else perf_counter() + time_limit
+
+        self.step_count = 0
+
+    def finish(self) -> None:
+        self.finished = True
+        self.paused = False
+
+    def after_task_step(self) -> bool:
+        self.step_count += 1
+        return (
+            self.paused
+            or self.step_count >= self.step_limit
+            or perf_counter() >= self.deadline
+        )
+
+
 # This holds all the state that gets trampolined back and forth between
 # callbacks when we're running in guest mode.
 #
@@ -1737,23 +1796,86 @@ class GuestState:  # type: ignore[explicit-any]
     run_sync_soon_threadsafe: Callable[[Callable[[], object]], object]
     run_sync_soon_not_threadsafe: Callable[[Callable[[], object]], object]
     done_callback: Callable[[Outcome[Any]], object]  # type: ignore[explicit-any]
-    unrolled_run_gen: Generator[float, EventResult, None]
+    unrolled_run_gen: Generator[float | object, EventResult | None, None]
     unrolled_run_next_send: Outcome[Any] = attrs.Factory(lambda: Value(None))  # type: ignore[explicit-any]
+    generation: int = 0
+    io_in_flight: bool = False
+    finished: bool = False
+    final_outcome: Outcome[Any] | None = None  # type: ignore[explicit-any]
+    last_max_steps: int | None = None
+    last_time_limit: float | None = None
+    stopping: bool = False
+    io_event: threading.Event = attrs.Factory(threading.Event)
 
-    def guest_tick(self) -> None:
+    def _schedule_tick(
+        self,
+        max_steps: int | None,
+        time_limit: float | None,
+    ) -> None:
+        self.generation += 1
+        generation = self.generation
+        self.runner.guest_tick_scheduled = True
+        self.run_sync_soon_not_threadsafe(
+            functools.partial(
+                self.guest_tick,
+                max_steps,
+                time_limit,
+                _generation=generation,
+            ),
+        )
+
+    def _finish(self, result: Outcome[Any]) -> None:  # type: ignore[explicit-any]
+        if self.finished:
+            return
+        self.finished = True
+        self.final_outcome = result
+        self.runner.driver.finish()
+        self.runner.guest_tick_scheduled = False
+        close_outcome = capture(self.unrolled_run_gen.close)
+        if isinstance(close_outcome, Error):
+            result = close_outcome
+            self.final_outcome = result
+        self.done_callback(result)
+
+    def guest_tick(
+        self,
+        max_steps: int | None = None,
+        time_limit: float | None = None,
+        *,
+        _generation: int | None = None,
+    ) -> None:
+        if (
+            self.finished
+            or self.runner.driver.paused
+            or (_generation is not None and _generation != self.generation)
+        ):
+            return
+
+        self.last_max_steps = max_steps
+        self.last_time_limit = time_limit
+        self.runner.driver.begin(max_steps, time_limit)
         prev_library, sniffio_library.name = sniffio_library.name, "trio"
         try:
-            timeout = self.unrolled_run_next_send.send(self.unrolled_run_gen)
+            request = self.unrolled_run_next_send.send(self.unrolled_run_gen)
         except StopIteration:
             assert self.runner.main_task_outcome is not None
-            self.done_callback(self.runner.main_task_outcome)
+            self._finish(self.runner.main_task_outcome)
             return
         except TrioInternalError as exc:
-            self.done_callback(Error(exc))
+            self._finish(Error(exc))
             return
         finally:
             sniffio_library.name = prev_library
 
+        if request is _DRIVE_BOUNDARY:
+            self.unrolled_run_next_send = Value(None)
+            if self.runner.driver.paused:
+                self.runner.guest_tick_scheduled = False
+            else:
+                self._schedule_tick(max_steps, time_limit)
+            return
+
+        timeout = cast("float", request)
         # Optimization: try to skip going into the thread if we can avoid it
         events_outcome: Value[EventResult] | Error = capture(
             self.runner.io_manager.get_events,
@@ -1762,24 +1884,197 @@ class GuestState:  # type: ignore[explicit-any]
         if timeout <= 0 or isinstance(events_outcome, Error) or events_outcome.value:
             # No need to go into the thread
             self.unrolled_run_next_send = events_outcome
-            self.runner.guest_tick_scheduled = True
-            self.run_sync_soon_not_threadsafe(self.guest_tick)
+            self._schedule_tick(max_steps, time_limit)
         else:
             # Need to go into the thread and call get_events() there
             self.runner.guest_tick_scheduled = False
+            self.io_in_flight = True
+            self.io_event.clear()
 
             def get_events() -> EventResult:
                 return self.runner.io_manager.get_events(timeout)
 
             def deliver(events_outcome: Outcome[EventResult]) -> None:
+                self.unrolled_run_next_send = events_outcome
+                self.io_event.set()
+                if self.stopping:
+                    return
+
                 def in_main_thread() -> None:
-                    self.unrolled_run_next_send = events_outcome
-                    self.runner.guest_tick_scheduled = True
-                    self.guest_tick()
+                    self.io_in_flight = False
+                    if self.finished:
+                        return
+                    if self.runner.driver.paused:
+                        self.runner.guest_tick_scheduled = False
+                    else:
+                        self._schedule_tick(
+                            self.last_max_steps,
+                            self.last_time_limit,
+                        )
 
                 self.run_sync_soon_threadsafe(in_main_thread)
 
             start_thread_soon(get_events, deliver)
+
+    def run_once(
+        self,
+        max_steps: int | None = None,
+        time_limit: float | None = None,
+    ) -> None:
+        if self.finished or self.runner.driver.paused:
+            return
+        gen = cast(
+            "types.GeneratorType[float | object, EventResult | None, None]",
+            self.unrolled_run_gen,
+        )
+        if gen.gi_running:
+            raise RuntimeError("Cannot drive a guest run from inside one of its tasks")
+        if self.io_in_flight:
+            self.runner.force_guest_tick_asap()
+            return
+        self.last_max_steps = max_steps
+        self.last_time_limit = time_limit
+        self.generation += 1
+        self.runner.guest_tick_scheduled = True
+        self.guest_tick(
+            max_steps,
+            time_limit,
+            _generation=self.generation,
+        )
+
+    def pause(self) -> None:
+        if self.finished or self.runner.driver.paused:
+            return
+        self.runner.driver.paused = True
+        self.generation += 1
+        self.runner.guest_tick_scheduled = False
+
+    def resume(
+        self,
+        max_steps: int | None = None,
+        time_limit: float | None = None,
+    ) -> None:
+        if self.finished:
+            return
+        if not self.runner.driver.paused:
+            return
+        if max_steps is not None:
+            self.last_max_steps = max_steps
+        if time_limit is not None:
+            self.last_time_limit = time_limit
+        self.runner.driver.paused = False
+        if self.io_in_flight:
+            return
+        self._schedule_tick(self.last_max_steps, self.last_time_limit)
+
+    def stop(self) -> None:
+        if self.finished:
+            return
+        gen = cast(
+            "types.GeneratorType[float | object, EventResult | None, None]",
+            self.unrolled_run_gen,
+        )
+        if gen.gi_running:
+            raise RuntimeError("Cannot stop a guest run from inside one of its tasks")
+
+        self.stopping = True
+        self.generation += 1
+        self.runner.guest_tick_scheduled = False
+        self.runner.driver.paused = False
+        if self.runner.system_nursery is not None:
+            self.runner.system_nursery.cancel_scope._cancel(
+                CancelReason(
+                    source="explicit",
+                    reason="Guest run was stopped by its host",
+                ),
+            )
+
+        if self.io_in_flight:
+            self.runner.force_guest_tick_asap()
+            self.io_event.wait()
+            self.io_in_flight = False
+
+        prev_library, sniffio_library.name = sniffio_library.name, "trio"
+        self.runner.driver.begin()
+        try:
+            while True:
+                try:
+                    request = self.unrolled_run_next_send.send(self.unrolled_run_gen)
+                except StopIteration:
+                    assert self.runner.main_task_outcome is not None
+                    self._finish(self.runner.main_task_outcome)
+                    return
+                except TrioInternalError as exc:
+                    self._finish(Error(exc))
+                    return
+
+                if request is _DRIVE_BOUNDARY:
+                    self.unrolled_run_next_send = Value(None)
+                else:
+                    timeout = cast("float", request)
+                    self.unrolled_run_next_send = capture(
+                        self.runner.io_manager.get_events,
+                        timeout,
+                    )
+        finally:
+            sniffio_library.name = prev_library
+
+
+@final
+class GuestRun(Generic[RetT], metaclass=NoPublicConstructor):
+    """A handle for controlling a guest run from its host loop.
+
+    These handles are returned by :func:`start_guest_run`. The automatically
+    scheduled callbacks use no quota, preserving the historical behavior of
+    running each ready batch to completion. Host code may call
+    :meth:`run_once` with a step or time quota to return control earlier.
+    """
+
+    _state: GuestState
+
+    def __init__(self, state: GuestState) -> None:
+        self._state = state
+
+    def run_once(
+        self,
+        *,
+        max_steps: int | None = None,
+        time_limit: float | None = None,
+    ) -> None:
+        """Run one pass, bounded by task steps and/or host wall-clock time."""
+        self._state.run_once(max_steps, time_limit)
+
+    def pause(self) -> None:
+        """Pause the guest run without cancelling tasks or discarding wakeups."""
+        self._state.pause()
+
+    def resume(
+        self,
+        *,
+        max_steps: int | None = None,
+        time_limit: float | None = None,
+    ) -> None:
+        """Resume a paused guest run."""
+        self._state.resume(max_steps, time_limit)
+
+    def stop(self) -> None:
+        """Cancel and finish a guest run, delivering its result to done_callback."""
+        self._state.stop()
+
+    @property
+    def paused(self) -> bool:
+        """Whether the guest run is currently paused."""
+        return self._state.runner.driver.paused
+
+    @property
+    def finished(self) -> bool:
+        """Whether the guest run has reached its final outcome."""
+        return self._state.finished
+
+    @property
+    def outcome(self) -> Outcome[RetT] | None:
+        """The final outcome, or None while the run is active."""
+        return cast("Outcome[RetT] | None", self._state.final_outcome)
 
 
 @attrs.define(eq=False)
@@ -1793,6 +2088,7 @@ class Runner:  # type: ignore[explicit-any]
     # Run-local values, see _local.py
     _locals: dict[_core.RunVar[Any], object] = attrs.Factory(dict)  # type: ignore[explicit-any]
 
+    driver: _Driver = attrs.Factory(_Driver)
     runq: deque[Task] = attrs.Factory(deque)
     tasks: set[Task] = attrs.Factory(set)
 
@@ -2525,13 +2821,18 @@ def run(
     prev_library, sniffio_library.name = sniffio_library.name, "trio"
     try:
         gen = unrolled_run(runner, async_fn, args)
+        runner.driver.begin()
         # Need to send None in the first time.
-        next_send: EventResult = None  # type: ignore[assignment]
+        next_send: EventResult | None = None
         while True:
             try:
-                timeout = gen.send(next_send)
+                request = gen.send(next_send)
             except StopIteration:
                 break
+            if request is _DRIVE_BOUNDARY:
+                next_send = None
+                continue
+            timeout = cast("float", request)
             next_send = runner.io_manager.get_events(timeout)
     finally:
         sniffio_library.name = prev_library
@@ -2558,15 +2859,16 @@ def start_guest_run(  # type: ignore[explicit-any]
     instruments: Sequence[Instrument] = (),
     restrict_keyboard_interrupt_to_checkpoints: bool = False,
     strict_exception_groups: bool = True,
-) -> None:
+) -> GuestRun[RetT]:
     """Start a "guest" run of Trio on top of some other "host" event loop.
 
     Each host loop can only have one guest run at a time.
 
-    You should always let the Trio run finish before stopping the host loop;
-    if not, it may leave Trio's internal data structures in an inconsistent
-    state. You might be able to get away with it if you immediately exit the
-    program, but it's safest not to go there in the first place.
+    You should normally let the Trio run finish before stopping the host loop.
+    If the host has to stop it early, call :meth:`GuestRun.stop` on the returned
+    handle so Trio can cancel tasks, close its resources, and deliver a final
+    outcome. Dropping the handle without finishing or stopping may leave
+    internal data structures in an inconsistent state.
 
     Generally, the best way to do this is wrap this in a function that starts
     the host loop and then immediately starts the guest run, and then shuts
@@ -2603,7 +2905,12 @@ def start_guest_run(  # type: ignore[explicit-any]
          you know. The argument is an `outcome.Outcome`, reporting what would
          have been returned or raised by `trio.run`. This function can do
          anything you want, but commonly you'll want it to shut down the
-         host loop, unwrap the outcome, etc.
+         host loop, unwrap the outcome, etc. It is invoked exactly once.
+
+         This function returns a :class:`GuestRun` handle. With default
+         arguments the guest continues running in full batches as before. The
+         host can also use the handle to run bounded passes, pause and resume
+         the guest, or explicitly stop it and receive a final outcome.
 
       run_sync_soon_not_threadsafe: Like ``run_sync_soon_threadsafe``, but
          will only be called from inside the host loop's main thread.
@@ -2616,6 +2923,9 @@ def start_guest_run(  # type: ignore[explicit-any]
          see :ref:`guest-run-implementation`.
 
     For the meaning of other arguments, see `trio.run`.
+
+    Returns:
+      GuestRun: A handle for bounded driving, pause/resume, and explicit stop.
 
     """
     if strict_exception_groups is not None and not strict_exception_groups:
@@ -2697,7 +3007,9 @@ def start_guest_run(  # type: ignore[explicit-any]
         )
 
     guest_state.unrolled_run_next_send = Value(next_send)
-    run_sync_soon_not_threadsafe(guest_state.guest_tick)
+    guest_run = cast("GuestRun[RetT]", GuestRun._create(guest_state))
+    guest_state._schedule_tick(None, None)
+    return guest_run
 
 
 # 24 hours is arbitrary, but it avoids issues like people setting timeouts of
@@ -2715,7 +3027,7 @@ def unrolled_run(
     async_fn: Callable[[Unpack[PosArgT]], Awaitable[object]],
     args: tuple[Unpack[PosArgT]],
     host_uses_signal_set_wakeup_fd: bool = False,
-) -> Generator[float, EventResult, None]:
+) -> Generator[float | object, EventResult | None, None]:
     __tracebackhide__ = True
 
     try:
@@ -2736,6 +3048,10 @@ def unrolled_run(
         # You know how people talk about "event loops"? This 'while' loop right
         # here is our event loop:
         while runner.tasks:
+            if runner.driver.paused:
+                yield _DRIVE_BOUNDARY
+                continue
+
             if runner.runq:
                 timeout: float = 0
             else:
@@ -2762,10 +3078,15 @@ def unrolled_run(
             # Driver will call io_manager.get_events(timeout) and pass it back
             # in through the yield
             events = yield timeout
+            events = cast("EventResult", events)
             runner.io_manager.process_events(events)
 
             if "after_io_wait" in runner.instruments:
                 runner.instruments.call("after_io_wait", timeout)
+
+            if runner.driver.paused:
+                yield _DRIVE_BOUNDARY
+                continue
 
             # Process cancellations due to deadline expiry
             now = runner.clock.current_time()
@@ -2926,19 +3247,22 @@ def unrolled_run(
                 if "after_task_step" in runner.instruments:
                     runner.instruments.call("after_task_step", task)
                 del GLOBAL_RUN_CONTEXT.task
+                if runner.driver.after_task_step():
+                    yield _DRIVE_BOUNDARY
                 # prevent long-lived references
                 # TODO: develop test for this deletion
                 del task, next_send, next_send_fn
 
     except GeneratorExit:
         # The run-loop generator has been garbage collected without finishing
-        warnings.warn(
-            RuntimeWarning(
-                "Trio guest run got abandoned without properly finishing... "
-                "weird stuff might happen",
-            ),
-            stacklevel=1,
-        )
+        if not runner.driver.finished:
+            warnings.warn(
+                RuntimeWarning(
+                    "Trio guest run got abandoned without properly finishing... "
+                    "weird stuff might happen",
+                ),
+                stacklevel=1,
+            )
     except TrioInternalError:
         raise
     except BaseException as exc:

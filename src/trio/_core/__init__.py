@@ -32,6 +32,7 @@ from ._parking_lot import (
 from ._run import (
     TASK_STATUS_IGNORED,
     CancelScope,
+    GuestRun,
     Nursery,
     RunStatistics,
     Task,
