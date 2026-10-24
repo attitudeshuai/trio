@@ -653,9 +653,91 @@ Asynchronous file objects
 
 .. Suppress type annotations here, they refer to lots of internal types.
    The normal Python docs go into better detail.
-.. autofunction:: open_file(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, closefd=None, opener=None)
+.. autofunction:: open_file(file, mode='r', buffering=-1, encoding=None, errors=None, newline=None, closefd=None, opener=None, lock=False)
 
 .. autofunction:: wrap_file(file)
+
+.. _file-locks:
+
+File locks
+~~~~~~~~~~
+
+Sometimes several tasks -- or several processes -- need to coordinate
+access to the same file: a state file that is read, modified, and
+written back, a log that must not be interleaved, a temporary file
+whose creation other workers race on, or child-process output that is
+being redirected to disk.  Trio provides asynchronous, cross-process
+advisory locks for these cases.
+
+The lock is implemented with the operating system's native byte-range
+locking (``fcntl.flock`` on POSIX, ``LockFileEx`` on Windows), so it
+arbitrates between both different processes and different tasks in the
+same process.  The actual lock is taken on a small *sidecar* file next
+to the target, named ``"<target>.trio-lock"``.  The sidecar also
+records who currently holds the lock (process id and acquisition time),
+which you can read with :meth:`FileLock.current_holder` even while you
+wait for the lock.
+
+The simplest way to lock is the ``lock`` argument of
+:func:`open_file` and :meth:`Path.open`::
+
+   async with await trio.open_file("state.json", "r+", lock=True) as f:
+       # the lock is held here, across tasks AND processes
+       ...
+   # closing the file releases the lock (even on cancellation/crash)
+
+For timed waits or stale-lock policies, pass a configured
+:class:`FileLock`::
+
+   lock = trio.FileLock(
+       "state.json",
+       default_timeout=5,
+       stale_policy=trio.StaleLockPolicy.TAKE_OVER,
+   )
+   async with await trio.open_file("state.json", "r+", lock=lock) as f:
+       ...
+
+Timeouts raise :class:`FileLockTimeout`, which is deliberately *not* an
+:class:`OSError`, so it cannot be confused with -- or swallowed by code
+handling -- actual locking failures.
+
+If a process is killed while holding a lock, the kernel releases the OS
+lock automatically.  The sidecar it leaves behind names the dead holder;
+:class:`StaleLockPolicy` decides what happens next: keep waiting
+(``WAIT``, the default), raise :class:`StaleLockError` (``ERROR``), or
+take over when the OS lock is provably free (``TAKE_OVER``).  Trio never
+forcibly steals a lock that a live process still holds, and it raises
+:class:`FileLockUnsupported` on a platform or filesystem that cannot
+provide locking rather than pretending the lock succeeded.  Every
+takeover records the evidence (previous holder and why it was judged
+stale) on :attr:`FileLock.last_takeover`.
+
+.. autoclass:: FileLock
+   :members:
+   :show-inheritance:
+
+.. autofunction:: open_file_lock
+
+.. autoclass:: LockHolder
+   :members:
+
+.. autoclass:: LockTakeover
+   :members:
+
+.. autoclass:: StaleLockPolicy
+   :members:
+
+.. autofunction:: open_temp_file
+
+.. autofunction:: open_state_file
+
+.. autoexception:: FileLockError
+
+.. autoexception:: FileLockTimeout
+
+.. autoexception:: FileLockUnsupported
+
+.. autoexception:: StaleLockError
 
 .. interface:: Asynchronous file interface
 
@@ -796,6 +878,17 @@ Currently, Trio always uses unbuffered byte streams for communicating
 with a process, so it does not support the ``encoding``, ``errors``,
 ``universal_newlines`` (alias ``text``), and ``bufsize``
 options.
+
+To redirect a child's output to a :ref:`locked file <file-locks>` on
+disk, pass an asynchronous file object opened with ``lock=True`` as
+``stdout``/``stderr``.  The file's descriptor is handed to the child at
+spawn, the lock stays held while the child runs, and
+:func:`run_process` flushes, closes, and unlocks the file automatically
+once the child has exited::
+
+   out = await trio.open_file("output.log", "wb", lock=True)
+   await trio.run_process([...], stdout=out)
+   # out is now closed and the lock is released
 
 
 .. _subprocess-quoting:

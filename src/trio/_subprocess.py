@@ -9,6 +9,7 @@ from contextlib import ExitStack
 from functools import partial
 from typing import (
     TYPE_CHECKING,
+    Any,
     Final,
     Literal,
     Protocol,
@@ -20,6 +21,7 @@ from typing import (
 import trio
 
 from ._core import ClosedResourceError, TaskStatus
+from ._file_io import _LockedAsyncIOWrapper
 from ._highlevel_generic import StapledStream
 from ._subprocess_platform import (
     create_pipe_from_child_output,
@@ -736,37 +738,61 @@ async def _run_process(
 
     # Opening the process does not need to be inside the nursery, so we put it outside
     # so any exceptions get directly seen by users.
+    #
+    # Locked file objects passed as redirections (opened with
+    # trio.open_file(..., lock=True)) are dup()'d by the child at spawn, so
+    # the underlying lock must stay held until the child exits and the file
+    # has to be flushed and closed afterwards. run_process owns the lifetime
+    # of those lock-tied wrappers here. Plain async file objects keep their
+    # traditional caller-owned semantics. The collection happens only once
+    # spawning succeeds -- if _open_process raises, the caller keeps
+    # ownership.
+    redirected_files: list[_LockedAsyncIOWrapper[Any]] = []  # type: ignore[explicit-any]
+    for key in ("stdin", "stdout", "stderr"):
+        obj = options.get(key)
+        if isinstance(obj, _LockedAsyncIOWrapper) and all(
+            obj is not other for other in redirected_files
+        ):
+            redirected_files.append(obj)
+
     proc = await _open_process(command, **options)  # type: ignore[arg-type]
-    async with trio.open_nursery() as nursery:
-        try:
-            if input_ is not None:
-                assert proc.stdin is not None
-                nursery.start_soon(feed_input, proc.stdin)
-                proc.stdin = None
-                proc.stdio = None
-            if capture_stdout:
-                assert proc.stdout is not None
-                nursery.start_soon(read_output, proc.stdout, stdout_chunks)
-                proc.stdout = None
-                proc.stdio = None
-            if capture_stderr:
-                assert proc.stderr is not None
-                nursery.start_soon(read_output, proc.stderr, stderr_chunks)
-                proc.stderr = None
-            task_status.started(proc)
-            await proc.wait()
-        except BaseException:
-            with trio.CancelScope(shield=True):
-                killer_cscope = trio.CancelScope(shield=True)
-
-                async def killer() -> None:
-                    with killer_cscope:
-                        await deliver_cancel(proc)
-
-                nursery.start_soon(killer)
+    try:
+        async with trio.open_nursery() as nursery:
+            try:
+                if input_ is not None:
+                    assert proc.stdin is not None
+                    nursery.start_soon(feed_input, proc.stdin)
+                    proc.stdin = None
+                    proc.stdio = None
+                if capture_stdout:
+                    assert proc.stdout is not None
+                    nursery.start_soon(read_output, proc.stdout, stdout_chunks)
+                    proc.stdout = None
+                    proc.stdio = None
+                if capture_stderr:
+                    assert proc.stderr is not None
+                    nursery.start_soon(read_output, proc.stderr, stderr_chunks)
+                    proc.stderr = None
+                task_status.started(proc)
                 await proc.wait()
-                killer_cscope.cancel(reason="trio internal implementation detail")
-                raise
+            except BaseException:
+                with trio.CancelScope(shield=True):
+                    killer_cscope = trio.CancelScope(shield=True)
+
+                    async def killer() -> None:
+                        with killer_cscope:
+                            await deliver_cancel(proc)
+
+                    nursery.start_soon(killer)
+                    await proc.wait()
+                    killer_cscope.cancel(reason="trio internal implementation detail")
+                    raise
+    finally:
+        # The child is dead (or spawn failed during supervision): flush and
+        # close redirected files, releasing any file lock they held.
+        with trio.CancelScope(shield=True):
+            for redirected in redirected_files:
+                await redirected.aclose()
 
     stdout = b"".join(stdout_chunks) if capture_stdout else None
     stderr = b"".join(stderr_chunks) if capture_stderr else None

@@ -54,6 +54,19 @@ from ._dtls import (
     DTLSEndpoint as DTLSEndpoint,
 )
 from ._file_io import open_file as open_file, wrap_file as wrap_file
+from ._file_lock import (
+    FileLock as FileLock,
+    FileLockError as FileLockError,
+    FileLockTimeout as FileLockTimeout,
+    FileLockUnsupported as FileLockUnsupported,
+    LockHolder as LockHolder,
+    LockTakeover as LockTakeover,
+    StaleLockError as StaleLockError,
+    StaleLockPolicy as StaleLockPolicy,
+    open_file_lock as open_file_lock,
+    open_state_file as open_state_file,
+    open_temp_file as open_temp_file,
+)
 from ._highlevel_generic import (
     StapledStream as StapledStream,
     aclose_forcefully as aclose_forcefully,

@@ -18,6 +18,7 @@ from typing import (
 
 import trio
 
+from ._file_lock import FileLock
 from ._util import async_wraps
 from .abc import AsyncResource
 
@@ -344,6 +345,56 @@ class AsyncIOWrapper(AsyncResource, Generic[FileT_co]):
         async def peek(self: AsyncIOWrapper[_CanPeek[AnyStr]], size: int = 0, /) -> AnyStr: ...
 
 
+class _LockedAsyncIOWrapper(AsyncIOWrapper[FileT_co]):
+    """An :class:`AsyncIOWrapper` whose lifetime is tied to a
+    :class:`~trio.FileLock`.
+
+    Closing the file (via :meth:`aclose`, an ``async with`` block,
+    cancellation, or an exception) first closes the wrapped file and then
+    releases the lock, all shielded from cancellation -- the lock never
+    outlives the file handle and no descriptor is left open.
+
+    A lock that the caller had already acquired before passing it in is not
+    owned by the wrapper: in that case the file is closed but the caller's
+    lock is left exactly as it was found.
+    """
+
+    __slots__ = ("_file_lock", "_owns_lock")
+
+    def __init__(
+        self,
+        file: FileT_co,
+        file_lock: FileLock,
+        owns_lock: bool,
+    ) -> None:
+        super().__init__(file)
+        self._file_lock = file_lock
+        self._owns_lock = owns_lock
+
+    @property
+    def file_lock(self) -> FileLock:
+        """The :class:`~trio.FileLock` held for this file object."""
+        return self._file_lock
+
+    async def aclose(self: _LockedAsyncIOWrapper[_CanClose]) -> None:
+        """Close the wrapped file and, if this object owns its lock, release
+        the lock too.
+
+        Like :meth:`AsyncIOWrapper.aclose`, this is shielded from
+        cancellation: the file (and an owned lock) are cleaned up even if the
+        surrounding scope has been cancelled.
+        """
+        try:
+            with trio.CancelScope(shield=True):
+                await trio.to_thread.run_sync(self._wrapped.close)
+        finally:
+            if self._owns_lock:
+                with trio.CancelScope(shield=True):
+                    await self._file_lock.aclose()
+
+        await trio.lowlevel.checkpoint_if_cancelled()
+
+
 # Type hints are copied from builtin open.
 _OpenFile = Union["StrOrBytesPath", int]
 _Opener = Callable[[str, int], int]
@@ -359,6 +410,8 @@ async def open_file(
     newline: str | None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[io.TextIOWrapper]: ...
 
 
@@ -372,6 +425,8 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[io.FileIO]: ...
 
 
@@ -385,6 +440,8 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[io.BufferedRandom]: ...
 
 
@@ -398,6 +455,8 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[io.BufferedWriter]: ...
 
 
@@ -411,6 +470,8 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[io.BufferedReader]: ...
 
 
@@ -424,6 +485,8 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[BinaryIO]: ...
 
 
@@ -437,6 +500,8 @@ async def open_file(  # type: ignore[explicit-any]  # Any usage matches builtins
     newline: str | None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[IO[Any]]: ...
 
 
@@ -449,8 +514,29 @@ async def open_file(
     newline: str | None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    lock: bool | FileLock = False,
 ) -> AsyncIOWrapper[object]:
     """Asynchronous version of :func:`open`.
+
+    Args:
+      lock: Whether to hold a :class:`~trio.FileLock` on the file for as
+          long as it is open.  ``False`` (the default) performs no locking
+          and behaves exactly like the plain async :func:`open`.  Pass
+          ``True`` to acquire a default exclusive lock on ``file`` before
+          the wrapper is returned; the lock is created and acquired by
+          this call, so closing the file releases it.  Pass a
+          :class:`~trio.FileLock` for custom behavior (for example
+          ``trio.FileLock(path, default_timeout=5)`` to bound the wait, or
+          ``trio.FileLock(path, stale_policy=...)`` for stale-lock
+          handling).  If the passed lock is already held, the file does not
+          take ownership and closing the file leaves the lock untouched; if
+          it is unacquired, the file acquires and owns it.  The lock is
+          released when an owned file object is closed -- whether
+          explicitly, by leaving an ``async with`` block, by task
+          cancellation, or by an exception.  Locking an integer file
+          descriptor is not supported (there is no path to derive the lock
+          file from).
 
     Returns:
         An :term:`asynchronous file object`
@@ -462,6 +548,11 @@ async def open_file(
                 pass
 
         assert f.closed
+
+    Locked example::
+
+        async with await trio.open_file(filename, "a", lock=True) as f:
+            await f.write("guarded across processes and tasks\\n")
 
     See also:
       :func:`trio.Path.open`
@@ -480,7 +571,44 @@ async def open_file(
             opener,
         ),
     )
-    return file_
+    if lock is False:
+        return file_
+
+    if lock is True:
+        if isinstance(file, int):
+            await file_.aclose()
+            raise ValueError(
+                "lock=True requires a path; cannot derive a lock file from "
+                "an integer file descriptor",
+            )
+        file_lock = FileLock(file)
+        acquired_here = True
+    elif isinstance(lock, FileLock):
+        file_lock = lock
+        acquired_here = not file_lock.locked
+    else:
+        await file_.aclose()
+        raise TypeError(
+            f"lock must be False, True, or a trio.FileLock instance, not {lock!r}",
+        )
+
+    try:
+        if acquired_here:
+            await file_lock.acquire()
+    except BaseException:
+        # The data file was opened before the lock attempt; close it
+        # (shielded) so neither descriptor nor half-open state survives a
+        # failed/abandoned acquisition.
+        with trio.CancelScope(shield=True):
+            await trio.to_thread.run_sync(file_._wrapped.close)
+        if lock is True:
+            # We created this lock object ourselves; acquire() already
+            # released any descriptor it opened, so aclose() is just a
+            # no-op cleanup.  A caller-provided lock is left untouched so
+            # they can retry acquire() on it.
+            await file_lock.aclose()
+        raise
+    return _LockedAsyncIOWrapper(file_._wrapped, file_lock, owns_lock=acquired_here)
 
 
 def wrap_file(file: FileT) -> AsyncIOWrapper[FileT]:

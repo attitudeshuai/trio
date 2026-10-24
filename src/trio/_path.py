@@ -17,7 +17,7 @@ from typing import (
     overload,
 )
 
-from trio._file_io import AsyncIOWrapper, wrap_file
+from trio._file_io import AsyncIOWrapper, open_file
 from trio._util import final
 from trio.to_thread import run_sync
 
@@ -33,6 +33,8 @@ if TYPE_CHECKING:
         OpenTextMode,
     )
     from typing_extensions import ParamSpec, Self
+
+    from trio._file_lock import FileLock
 
     P = ParamSpec("P")
 
@@ -150,6 +152,8 @@ class Path(pathlib.PurePath):
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[TextIOWrapper]: ...
 
     @overload
@@ -160,6 +164,8 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[FileIO]: ...
 
     @overload
@@ -170,6 +176,8 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[BufferedRandom]: ...
 
     @overload
@@ -180,6 +188,8 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[BufferedWriter]: ...
 
     @overload
@@ -190,6 +200,8 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[BufferedReader]: ...
 
     @overload
@@ -200,6 +212,8 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[BinaryIO]: ...
 
     @overload
@@ -210,11 +224,35 @@ class Path(pathlib.PurePath):
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
+        *,
+        lock: bool | FileLock = False,
     ) -> AsyncIOWrapper[IO[Any]]: ...
 
-    @_wraps_async(pathlib.Path.open)
-    def open(self, *args: Any, **kwargs: Any) -> AsyncIOWrapper[IO[Any]]:  # type: ignore[misc, explicit-any]  # Overload return mismatch.
-        return wrap_file(self._wrapped_cls(self).open(*args, **kwargs))
+    async def open(  # type: ignore[explicit-any]  # Any usage matches builtins.open().
+        self,
+        mode: str = "r",
+        buffering: int = -1,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+        *,
+        lock: bool | FileLock = False,
+    ) -> AsyncIOWrapper[IO[Any]]:
+        """Like :meth:`pathlib.Path.open`, but async.
+
+        ``lock`` behaves exactly like the ``lock`` argument of
+        :func:`trio.open_file`: pass ``True`` to hold an exclusive
+        :class:`~trio.FileLock` on the file until it is closed.
+        """
+        return await open_file(
+            os.fspath(self._wrapped_cls(self)),
+            mode,
+            buffering,
+            encoding,
+            errors,
+            newline,
+            lock=lock,
+        )
 
     def __repr__(self) -> str:
         return f"trio.Path({str(self)!r})"
