@@ -1,0 +1,13 @@
+``trio.run_process`` now accepts ``stdout_limit`` and ``stderr_limit``
+(an integer or a `trio.OutputLimit`) to bound how much captured output is
+kept in memory. Overflow can be truncated (keeping the head) or handled
+with ``on_overflow="keep_head_tail"`` to keep both ends; the returned
+`subprocess.CompletedProcess` and raised `subprocess.CalledProcessError`
+gain ``stdout_capture`` / ``stderr_capture`` `trio.CapturedOutput`
+objects reporting whether truncation happened and how many bytes were
+discarded. Output already captured when the call is cancelled or times
+out is now attached to the propagating `trio.Cancelled` (or the
+exception group containing it) instead of being lost. The new
+`trio.CapturingReceiveStream` provides the same declaration and
+accounting when reading a `trio.Process` stream chunk by chunk. Without
+a declared limit, collection semantics are unchanged.

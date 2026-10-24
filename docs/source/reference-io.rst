@@ -739,6 +739,22 @@ task and interact with it while it's running:
 
 .. autofunction:: trio.run_process
 
+To bound how much captured output is retained in memory, pass
+``stdout_limit`` / ``stderr_limit`` to `~trio.run_process`, or wrap a
+process stream in `CapturingReceiveStream` when reading it yourself.
+The outcome of each captured stream is reported as a
+`CapturedOutput`, including whether it was truncated and how many bytes
+were discarded.
+
+.. autoclass:: trio.OutputLimit
+   :members:
+
+.. autoclass:: trio.CapturedOutput
+   :members:
+
+.. autoclass:: trio.CapturingReceiveStream
+   :members:
+
 .. autoclass:: trio._subprocess.HasFileno(Protocol)
 
    .. automethod:: fileno

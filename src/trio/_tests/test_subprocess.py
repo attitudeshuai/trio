@@ -6,7 +6,7 @@ import random
 import signal
 import subprocess
 import sys
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Iterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from functools import partial
 from pathlib import Path as SyncPath
@@ -24,7 +24,10 @@ import pytest
 import trio
 
 from .. import (
+    CapturedOutput,
+    CapturingReceiveStream,
     Event,
+    OutputLimit,
     Process,
     _core,
     fail_after,
@@ -34,8 +37,12 @@ from .. import (
     sleep_forever,
 )
 from .._core._tests.tutil import skip_if_fbsd_pipes_broken, slow
+from .._subprocess import _OutputBuffer
 from ..lowlevel import open_process
 from ..testing import MockClock, assert_no_checkpoints, wait_all_tasks_blocked
+
+if sys.version_info < (3, 11):
+    from exceptiongroup import BaseExceptionGroup
 
 if TYPE_CHECKING:
     from types import FrameType
@@ -409,6 +416,444 @@ async def test_run_check() -> None:
     assert result.stdout == b""
     assert result.stderr == b"test\n"
     assert result.returncode == 1
+
+
+def _iter_exceptions(exc: BaseException) -> Iterator[BaseException]:
+    yield exc
+    if isinstance(exc, BaseExceptionGroup):
+        for nested in exc.exceptions:
+            yield from _iter_exceptions(nested)
+
+
+def _captured_attr(obj: object, name: str) -> Any:  # type: ignore[explicit-any]
+    # stdout/stderr/*_capture are attached at runtime to stdlib
+    # CompletedProcess/CalledProcessError/Cancelled objects, whose type
+    # stubs don't declare them.
+    return getattr(obj, name)
+
+
+def test_output_limit_validation() -> None:
+    limit = OutputLimit(100)
+    assert limit.max_bytes == 100
+    assert limit.on_overflow == "truncate"
+    assert limit.head_bytes == 100
+    assert limit.tail_bytes == 0
+
+    head_tail = OutputLimit(100, on_overflow="keep_head_tail")
+    assert head_tail.head_bytes == 50
+    assert head_tail.tail_bytes == 50
+    head_tail = OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=30)
+    assert head_tail.head_bytes == 70
+    assert head_tail.tail_bytes == 30
+
+    with pytest.raises(ValueError, match="max_bytes"):
+        OutputLimit(0)
+    with pytest.raises(ValueError, match="max_bytes"):
+        OutputLimit(-1)
+    with pytest.raises(TypeError, match="max_bytes"):
+        OutputLimit(1.5)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="max_bytes"):
+        OutputLimit(True)
+    with pytest.raises(ValueError, match="on_overflow"):
+        OutputLimit(100, on_overflow="explode")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="tail_bytes"):
+        OutputLimit(100, tail_bytes=10)
+    with pytest.raises(ValueError, match="tail_bytes"):
+        OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=101)
+    with pytest.raises(TypeError, match="tail_bytes"):
+        OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=1.5)  # type: ignore[arg-type]
+
+    # value semantics
+    assert OutputLimit(100) == OutputLimit(100)
+    assert OutputLimit(100) != OutputLimit(101)
+    assert OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=30) == OutputLimit(
+        100,
+        on_overflow="keep_head_tail",
+        tail_bytes=30,
+    )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 64, 257, 4096])
+def test_output_buffer_truncate(chunk_size: int) -> None:
+    total = 1000
+    data = bytes(i % 251 for i in range(total))
+    buf = _OutputBuffer(OutputLimit(100))
+    for start in range(0, total, chunk_size):
+        buf.add(data[start : start + chunk_size])
+    captured = buf.result()
+    assert isinstance(captured, CapturedOutput)
+    assert captured.data == data[:100]
+    assert captured.truncated
+    assert captured.discarded_bytes == 900
+    assert captured.total_bytes == 1000
+    assert len(captured.data) + captured.discarded_bytes == captured.total_bytes
+    assert captured.limit == OutputLimit(100)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 7, 64, 257, 4096])
+def test_output_buffer_keep_head_tail(chunk_size: int) -> None:
+    total = 1000
+    data = bytes(i % 251 for i in range(total))
+    buf = _OutputBuffer(OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=30))
+    for start in range(0, total, chunk_size):
+        buf.add(memoryview(data)[start : start + chunk_size])
+    captured = buf.result()
+    assert captured.data == data[:70] + data[-30:]
+    assert captured.truncated
+    assert captured.discarded_bytes == 900
+    assert captured.total_bytes == 1000
+    assert len(captured.data) == 100
+
+
+def test_output_buffer_boundary_cases() -> None:
+    data = bytes(range(256))
+
+    # exactly at the bound: nothing discarded
+    exact = _OutputBuffer(OutputLimit(len(data)))
+    exact.add(data)
+    captured = exact.result()
+    assert captured.data == data
+    assert not captured.truncated
+    assert captured.discarded_bytes == 0
+
+    # one byte over: head truncation
+    over = _OutputBuffer(OutputLimit(100))
+    over.add(data[:99])
+    over.add(data[99:101])
+    over.add(data[101:])
+    captured = over.result()
+    assert captured.data == data[:100]
+    assert captured.discarded_bytes == 156
+
+    # keep_head_tail with zero tail: pure head
+    head_only = _OutputBuffer(
+        OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=0),
+    )
+    head_only.add(data)
+    assert head_only.result().data == data[:100]
+
+    # keep_head_tail with full tail: pure tail
+    tail_only = _OutputBuffer(
+        OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=100),
+    )
+    tail_only.add(data)
+    assert tail_only.result().data == data[-100:]
+
+    # unbounded: everything retained, full accounting
+    unbounded = _OutputBuffer(None)
+    unbounded.add(data[:10])
+    unbounded.add(memoryview(data)[10:])
+    captured = unbounded.result()
+    assert captured.data == data
+    assert not captured.truncated
+    assert captured.discarded_bytes == 0
+    assert captured.total_bytes == len(data)
+    assert captured.limit is None
+
+
+async def test_run_stdout_limit_truncate() -> None:
+    data = bytes(i % 251 for i in range(5000))
+    result = await run_process(CAT, stdin=data, stdout_limit=100)
+    assert result.stdout == data[:100]
+    assert result.stderr is None
+    captured: CapturedOutput | None = _captured_attr(result, "stdout_capture")
+    assert captured is not None
+    assert captured.data == result.stdout
+    assert captured.truncated
+    assert captured.discarded_bytes == 4900
+    assert captured.total_bytes == 5000
+    assert captured.limit == OutputLimit(100)
+    assert _captured_attr(result, "stderr_capture") is None
+
+    # an OutputLimit with an explicit policy works too
+    result = await run_process(
+        CAT,
+        stdin=data,
+        stdout_limit=OutputLimit(100),
+    )
+    assert result.stdout == data[:100]
+    assert _captured_attr(result, "stdout_capture").discarded_bytes == 4900
+
+
+async def test_run_stdout_limit_bounds_many_chunks() -> None:
+    # Much more than a pipe buffer full, arriving in many 64KiB reads:
+    # the retained amount must never exceed the declared bound.
+    data = bytes(i % 251 for i in range(300_000))
+    result = await run_process(
+        CAT,
+        stdin=data,
+        stdout_limit=OutputLimit(4096, on_overflow="keep_head_tail", tail_bytes=1000),
+    )
+    captured: CapturedOutput | None = _captured_attr(result, "stdout_capture")
+    assert captured is not None
+    assert len(captured.data) == 4096
+    assert captured.data == data[:3096] + data[-1000:]
+    assert captured.discarded_bytes == 300_000 - 4096
+    assert captured.total_bytes == 300_000
+    assert captured.truncated
+
+
+async def test_run_stdout_limit_keep_head_tail() -> None:
+    data = bytes(65 + i % 26 for i in range(5000))
+    limit = OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=40)
+    result = await run_process(CAT, stdin=data, stdout_limit=limit)
+    assert result.stdout == data[:60] + data[-40:]
+    captured: CapturedOutput | None = _captured_attr(result, "stdout_capture")
+    assert captured is not None
+    assert captured.truncated
+    assert captured.discarded_bytes == 4900
+    assert captured.total_bytes == 5000
+    assert captured.limit == limit
+
+
+async def test_run_limits_per_stream_and_merged() -> None:
+    # two streams: each limit is accounted for independently
+    cmd = python(
+        "sys.stdout.buffer.write(b'o' * 300); sys.stderr.buffer.write(b'e' * 200)"
+    )
+    result = await run_process(cmd, stdout_limit=100, stderr_limit=50)
+    assert result.stdout == b"o" * 100
+    assert result.stderr == b"e" * 50
+    assert _captured_attr(result, "stdout_capture").discarded_bytes == 200
+    assert _captured_attr(result, "stderr_capture").discarded_bytes == 150
+
+    # merged streams: the single limit covers the combined total
+    cmd = python(
+        "sys.stdout.buffer.write(b'o' * 80); sys.stderr.buffer.write(b'e' * 80)"
+    )
+    result = await run_process(
+        cmd,
+        capture_stdout=True,
+        stderr=subprocess.STDOUT,
+        stdout_limit=100,
+    )
+    assert result.stderr is None
+    assert _captured_attr(result, "stderr_capture") is None
+    captured: CapturedOutput | None = _captured_attr(result, "stdout_capture")
+    assert captured is not None
+    assert captured.total_bytes == 160
+    assert len(captured.data) == 100
+    assert captured.discarded_bytes == 60
+    assert captured.truncated
+    assert result.stdout == captured.data
+
+
+async def test_run_capture_metadata_without_limit() -> None:
+    # existing fields are unchanged; accounting metadata is still present
+    data = b"hello"
+    result = await run_process(
+        CAT,
+        stdin=data,
+        capture_stdout=True,
+        capture_stderr=True,
+    )
+    assert result.stdout == b"hello"
+    assert result.stderr == b""
+    assert _captured_attr(result, "stdout_capture") == CapturedOutput(
+        b"hello",
+        False,
+        0,
+        5,
+        None,
+    )
+    assert _captured_attr(result, "stderr_capture") == CapturedOutput(
+        b"",
+        False,
+        0,
+        0,
+        None,
+    )
+
+    result = await run_process(EXIT_TRUE)
+    assert result.stdout is None
+    assert result.stderr is None
+    assert _captured_attr(result, "stdout_capture") is None
+    assert _captured_attr(result, "stderr_capture") is None
+
+
+async def test_run_limit_called_process_error_metadata() -> None:
+    cmd = python("sys.stderr.buffer.write(b'e' * 500); sys.exit(2)")
+    with pytest.raises(subprocess.CalledProcessError) as excinfo:
+        await run_process(cmd, stderr_limit=100)
+    err = excinfo.value
+    assert err.returncode == 2
+    assert err.stderr == b"e" * 100
+    assert err.stdout is None
+    assert _captured_attr(err, "stdout_capture") is None
+    captured: CapturedOutput | None = _captured_attr(err, "stderr_capture")
+    assert captured is not None
+    assert captured.data == err.stderr
+    assert captured.truncated
+    assert captured.discarded_bytes == 400
+    assert captured.total_bytes == 500
+    assert captured.limit == OutputLimit(100)
+
+
+async def test_run_limit_invalid_arguments() -> None:
+    with pytest.raises(ValueError, match="stdout_limit"):
+        await run_process(CAT, stdout_limit=100, stdout=subprocess.DEVNULL)
+    with pytest.raises(ValueError, match="stderr_limit"):
+        await run_process(CAT, stderr_limit=100, stderr=subprocess.STDOUT)
+    with pytest.raises(TypeError, match="stdout_limit"):
+        await run_process(CAT, stdout_limit="100")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_bytes"):
+        await run_process(CAT, stdout_limit=0)
+
+    with pytest.raises(TypeError, match="limit"):
+        CapturingReceiveStream(object(), limit="100")  # type: ignore[arg-type]
+
+
+async def test_capturing_receive_stream() -> None:
+    data = bytes(65 + i % 26 for i in range(5000))
+    proc = await open_process(CAT, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    capture_stream = CapturingReceiveStream(
+        proc.stdout,
+        limit=OutputLimit(100, on_overflow="keep_head_tail", tail_bytes=30),
+    )
+
+    async def feed_input() -> None:
+        assert proc.stdin is not None
+        async with proc.stdin:
+            await proc.stdin.send_all(data)
+
+    seen = bytearray()
+    async with _core.open_nursery() as nursery:
+        nursery.start_soon(feed_input)
+        # chunks pass through unchanged: callers can consume them however
+        # they like (here, just accumulating), while accounting happens.
+        async with capture_stream:
+            async for chunk in capture_stream:
+                seen.extend(chunk)
+    assert bytes(seen) == data
+
+    captured = capture_stream.capture
+    assert captured.data == data[:70] + data[-30:]
+    assert captured.truncated
+    assert captured.discarded_bytes == 4900
+    assert captured.total_bytes == 5000
+
+    # the wrapper owns and closed the underlying stream
+    assert proc.stdout is not None
+    with pytest.raises(trio.ClosedResourceError):
+        await proc.stdout.receive_some(1)
+    await proc.wait()
+    assert proc.returncode == 0
+
+
+async def test_capturing_receive_stream_unbounded() -> None:
+    data = b"unbounded passthrough"
+    proc = await open_process(CAT, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    assert proc.stdin is not None
+    assert proc.stdout is not None
+    capture_stream = CapturingReceiveStream(proc.stdout)
+    assert capture_stream.capture == CapturedOutput(b"", False, 0, 0, None)
+    async with _core.open_nursery() as nursery:
+
+        async def feed_input() -> None:
+            assert proc.stdin is not None
+            async with proc.stdin:
+                await proc.stdin.send_all(data)
+
+        nursery.start_soon(feed_input)
+        async with capture_stream:
+            assert await capture_stream.receive_some() == data
+            assert await capture_stream.receive_some() == b""
+    captured = capture_stream.capture
+    assert captured.data == data
+    assert not captured.truncated
+    assert captured.limit is None
+    await proc.wait()
+
+
+async def test_run_partial_output_on_cancel() -> None:
+    cmd = python(
+        "sys.stdout.buffer.write(b'partial\\n'); "
+        "sys.stdout.buffer.flush(); "
+        "import time; time.sleep(30)",
+    )
+    captured_exc: dict[str, BaseException] = {}
+    with trio.CancelScope() as scope:
+        async with _core.open_nursery() as nursery:
+
+            async def cancel_it() -> None:
+                await sleep(0.7)
+                scope.cancel()
+
+            nursery.start_soon(cancel_it)
+            try:
+                await run_process(cmd, stdout_limit=4)
+            except BaseException as caught:
+                captured_exc["exc"] = caught
+                raise
+
+    cancelled = [
+        cancelled_exc
+        for cancelled_exc in _iter_exceptions(captured_exc["exc"])
+        if isinstance(cancelled_exc, trio.Cancelled)
+    ]
+    assert cancelled
+    for cancelled_exc in cancelled:
+        # the already-collected head comes back with the cancellation,
+        # along with the same truncation accounting
+        assert _captured_attr(cancelled_exc, "stdout") == b"part"
+        assert _captured_attr(cancelled_exc, "stderr") is None
+        assert _captured_attr(cancelled_exc, "stderr_capture") is None
+        captured: CapturedOutput | None = _captured_attr(
+            cancelled_exc,
+            "stdout_capture",
+        )
+        assert captured is not None
+        assert captured.data == b"part"
+        assert captured.truncated
+        assert captured.discarded_bytes == 4
+        assert captured.total_bytes == 8
+        assert captured.limit == OutputLimit(4)
+
+
+async def test_run_partial_output_on_timeout() -> None:
+    cmd = python(
+        "sys.stdout.buffer.write(b'partial\\n'); "
+        "sys.stdout.buffer.flush(); "
+        "import time; time.sleep(30)",
+    )
+    seen: list[BaseException] = []
+    with pytest.raises(trio.TooSlowError):
+        with fail_after(1):
+            try:
+                await run_process(cmd, stdout_limit=4)
+            except BaseException as caught:
+                # Catch the Cancelled (or a group containing it) while it
+                # passes through this scope, since fail_after replaces it
+                # with TooSlowError.
+                seen.append(caught)
+                raise
+
+    assert len(seen) == 1
+    cancelled = [
+        cancelled_exc
+        for cancelled_exc in _iter_exceptions(seen[0])
+        if isinstance(cancelled_exc, trio.Cancelled)
+    ]
+    assert cancelled
+    for cancelled_exc in cancelled:
+        assert _captured_attr(cancelled_exc, "stdout") == b"part"
+        assert _captured_attr(cancelled_exc, "stdout_capture").discarded_bytes == 4
+
+
+async def test_run_cancel_before_spawn_has_empty_capture() -> None:
+    # cancellation that lands at the spawn checkpoint still gets uniform
+    # (empty) attributes instead of an AttributeError
+    with trio.CancelScope() as scope:
+        scope.cancel()
+        with pytest.raises(trio.Cancelled) as excinfo:
+            await run_process(EXIT_TRUE, capture_stdout=True)
+    cancelled_exc = excinfo.value
+    assert _captured_attr(cancelled_exc, "stdout") is None
+    assert _captured_attr(cancelled_exc, "stderr") is None
+    assert _captured_attr(cancelled_exc, "stdout_capture") is None
+    assert _captured_attr(cancelled_exc, "stderr_capture") is None
 
 
 @skip_if_fbsd_pipes_broken

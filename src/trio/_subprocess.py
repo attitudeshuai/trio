@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import warnings
+from collections import deque
 from contextlib import ExitStack
 from functools import partial
 from typing import (
@@ -17,8 +18,11 @@ from typing import (
     overload,
 )
 
+import attrs
+
 import trio
 
+from ._abc import ReceiveStream
 from ._core import ClosedResourceError, TaskStatus
 from ._highlevel_generic import StapledStream
 from ._subprocess_platform import (
@@ -36,7 +40,11 @@ if TYPE_CHECKING:
 
     from typing_extensions import Unpack
 
-    from ._abc import ReceiveStream, SendStream
+    from ._abc import SendStream
+
+if sys.version_info < (3, 11):
+    # On 3.10 the builtin doesn't exist; trio depends on the backport there.
+    from exceptiongroup import BaseExceptionGroup
 
 
 # Sphinx cannot parse the stringified version
@@ -99,6 +107,337 @@ class HasFileno(Protocol):
     """Represents any file-like object that has a file descriptor."""
 
     def fileno(self) -> int: ...
+
+
+# Sphinx cannot parse the stringified version
+OutputOverflowPolicy: TypeAlias = Literal["truncate", "keep_head_tail"]
+
+
+@final
+class OutputLimit:
+    r"""A bound on how much of one subprocess output stream is collected.
+
+    Output limits can be declared on `trio.run_process` (as
+    ``stdout_limit`` / ``stderr_limit``), or on a
+    `CapturingReceiveStream` wrapped around a `Process.stdout` /
+    `Process.stderr` stream that you read yourself. Declaring a limit
+    caps the amount of the child's output that Trio keeps in memory,
+    which matters for long-running processes that emit output
+    continuously. When no limit is declared, the full stream is
+    collected, exactly as without this feature.
+
+    When stdout and stderr are captured as two separate streams, each
+    gets its own limit and its own accounting. When they are merged
+    (``stderr=subprocess.STDOUT``), the single ``stdout_limit`` applies
+    to the combined output.
+
+    Args:
+      max_bytes: Maximum number of bytes to retain from the stream.
+          Must be a positive integer. A bare integer may be passed
+          wherever an `OutputLimit` is accepted as shorthand for
+          ``OutputLimit(max_bytes)``.
+      on_overflow: What to retain once more than *max_bytes* bytes have
+          arrived:
+
+          - ``"truncate"`` (the default): retain the first *max_bytes*
+            bytes (the head of the stream) and discard everything that
+            follows.
+          - ``"keep_head_tail"``: retain the first *head_bytes* and the
+            last *tail_bytes* bytes, and discard everything in between.
+      tail_bytes: Number of bytes to reserve for the tail when
+          *on_overflow* is ``"keep_head_tail"``; the other
+          ``max_bytes - tail_bytes`` bytes are reserved for the head.
+          Defaults to ``max_bytes // 2``. May not be combined with
+          ``on_overflow="truncate"``.
+
+    Attributes:
+      max_bytes (int): The declared bound.
+      on_overflow (str): The declared overflow policy.
+      head_bytes (int): Bytes retained from the start of the stream
+          after overflow (equal to *max_bytes* for ``"truncate"``).
+      tail_bytes (int): Bytes retained from the end of the stream
+          after overflow (``0`` for ``"truncate"``).
+
+    """
+
+    def __init__(
+        self,
+        max_bytes: int,
+        *,
+        on_overflow: OutputOverflowPolicy = "truncate",
+        tail_bytes: int | None = None,
+    ) -> None:
+        if isinstance(max_bytes, bool) or not isinstance(max_bytes, int):
+            raise TypeError("max_bytes must be an integer")
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be >= 1")
+        if on_overflow not in ("truncate", "keep_head_tail"):
+            raise ValueError(
+                "on_overflow must be either 'truncate' or 'keep_head_tail', "
+                f"not {on_overflow!r}",
+            )
+        if on_overflow == "truncate":
+            if tail_bytes is not None:
+                raise ValueError(
+                    "tail_bytes can only be used with on_overflow='keep_head_tail'",
+                )
+            tail_bytes = 0
+        elif tail_bytes is None:
+            tail_bytes = max_bytes // 2
+        else:
+            if isinstance(tail_bytes, bool) or not isinstance(tail_bytes, int):
+                raise TypeError("tail_bytes must be an integer")
+            if not 0 <= tail_bytes <= max_bytes:
+                raise ValueError("tail_bytes must satisfy 0 <= tail_bytes <= max_bytes")
+
+        self._max_bytes = max_bytes
+        self._on_overflow: OutputOverflowPolicy = on_overflow
+        self._tail_bytes = tail_bytes
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def on_overflow(self) -> OutputOverflowPolicy:
+        return self._on_overflow
+
+    @property
+    def head_bytes(self) -> int:
+        return self._max_bytes - self._tail_bytes
+
+    @property
+    def tail_bytes(self) -> int:
+        return self._tail_bytes
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, OutputLimit):
+            return NotImplemented
+        return (
+            self._max_bytes == other._max_bytes
+            and self._on_overflow == other._on_overflow
+            and self._tail_bytes == other._tail_bytes
+        )
+
+    def __hash__(self) -> int:
+        return hash((self._max_bytes, self._on_overflow, self._tail_bytes))
+
+    def __repr__(self) -> str:
+        if self._on_overflow == "truncate":
+            return f"OutputLimit(max_bytes={self._max_bytes})"
+        return (
+            f"OutputLimit(max_bytes={self._max_bytes}, "
+            f"on_overflow='keep_head_tail', tail_bytes={self._tail_bytes})"
+        )
+
+
+@final
+@attrs.frozen
+class CapturedOutput:
+    """What was collected from a single subprocess output stream.
+
+    A `CapturedOutput` is attached to the `subprocess.CompletedProcess`
+    returned by `trio.run_process` and to the `subprocess.CalledProcessError`
+    or `trio.Cancelled` it raises, as the ``stdout_capture`` and
+    ``stderr_capture`` attributes (``None`` for streams that weren't
+    captured). It is also available at any time from
+    `CapturingReceiveStream.capture` when reading a process stream
+    directly.
+
+    Attributes:
+      data (bytes): The bytes that were retained: the whole stream when
+          no limit was declared, otherwise its head, or its head plus
+          tail, according to the declared `OutputLimit`.
+      truncated (bool): Whether any bytes were discarded because the
+          declared limit was reached.
+      discarded_bytes (int): How many bytes arrived on the stream but
+          were not retained.
+      total_bytes (int): How many bytes arrived on the stream in total;
+          equal to ``len(data) + discarded_bytes``.
+      limit (OutputLimit or None): The limit that was declared, or
+          ``None`` for unbounded collection.
+
+    """
+
+    data: bytes
+    truncated: bool
+    discarded_bytes: int
+    total_bytes: int
+    limit: OutputLimit | None
+
+
+class _OutputBuffer:
+    """Collects one stream through a single, bounded accounting scheme.
+
+    ``retained bytes + discarded_bytes == total_bytes`` always holds,
+    and with a limit ``retained bytes <= limit.max_bytes``.
+    """
+
+    def __init__(self, limit: OutputLimit | None) -> None:
+        self._limit = limit
+        # Retained prefix: the whole stream while unbounded, the head
+        # once a keep_head_tail buffer saturates.
+        self._head: list[bytes] = []
+        self._head_size = 0
+        # Only used for keep_head_tail, created when the bound is hit.
+        self._tail: deque[bytes] | None = None
+        self._tail_size = 0
+        self.discarded_bytes = 0
+        self.total_bytes = 0
+
+    def add(self, chunk: bytes | bytearray | memoryview) -> None:
+        data = chunk if isinstance(chunk, bytes) else bytes(chunk)
+        n = len(data)
+        self.total_bytes += n
+        limit = self._limit
+        if limit is None:
+            self._head.append(data)
+            self._head_size += n
+            return
+
+        if limit.on_overflow == "truncate":
+            room = limit.max_bytes - self._head_size
+            if room <= 0:
+                self.discarded_bytes += n
+            elif n <= room:
+                self._head.append(data)
+                self._head_size += n
+            else:
+                self._head.append(data[:room])
+                self._head_size += room
+                self.discarded_bytes += n - room
+            return
+
+        # keep_head_tail
+        if self._tail is None:
+            if self._head_size + n <= limit.max_bytes:
+                self._head.append(data)
+                self._head_size += n
+                return
+            # The bound is crossed by this chunk: split everything seen
+            # so far into the final head and tail.
+            combined = b"".join([*self._head, data])
+            head_size = limit.head_bytes
+            head = combined[:head_size]
+            self._head = [head] if head else []
+            self._head_size = len(head)
+            self._tail = deque()
+            tail_start = len(combined) - limit.tail_bytes
+            self._append_tail(combined[tail_start:])
+            middle = tail_start - head_size
+            if middle > 0:
+                self.discarded_bytes += middle
+        else:
+            self._append_tail(data)
+
+    def _append_tail(self, data: bytes) -> None:
+        assert self._limit is not None
+        tail_bytes = self._limit.tail_bytes
+        if not data:
+            return
+        if tail_bytes == 0:
+            self.discarded_bytes += len(data)
+            return
+        assert self._tail is not None
+        self._tail.append(data)
+        self._tail_size += len(data)
+        while self._tail_size > tail_bytes:
+            excess = self._tail_size - tail_bytes
+            first = self._tail[0]
+            if len(first) <= excess:
+                self._tail.popleft()
+                self._tail_size -= len(first)
+                self.discarded_bytes += len(first)
+            else:
+                self._tail[0] = first[excess:]
+                self._tail_size -= excess
+                self.discarded_bytes += excess
+
+    def result(self) -> CapturedOutput:
+        if self._tail is None:
+            data = b"".join(self._head)
+        else:
+            data = b"".join([*self._head, *self._tail])
+        return CapturedOutput(
+            data=data,
+            truncated=self.discarded_bytes > 0,
+            discarded_bytes=self.discarded_bytes,
+            total_bytes=self.total_bytes,
+            limit=self._limit,
+        )
+
+
+def _coerce_output_limit(
+    limit: int | OutputLimit | None,
+    name: str,
+) -> OutputLimit | None:
+    if limit is None or isinstance(limit, OutputLimit):
+        return limit
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise TypeError(f"{name} must be an int or trio.OutputLimit")
+    return OutputLimit(limit)
+
+
+@final
+class CapturingReceiveStream(ReceiveStream):
+    """A transparent `~trio.abc.ReceiveStream` wrapper that accounts for
+    everything read through it.
+
+    Use this when you hold a `Process` yourself (from
+    `trio.lowlevel.open_process` or ``nursery.start(trio.run_process,
+    ...)``) and read its ``stdout``/``stderr`` in chunks, but still want
+    a declared bound and a `CapturedOutput` with truncation information.
+    Chunks pass through unchanged, so you can process them however you
+    like – write them to a file, decode them line by line, and so on –
+    while the retained output stays bounded::
+
+       capturing = trio.CapturingReceiveStream(proc.stdout, limit=4096)
+       async with capturing:
+           async for chunk in capturing:
+               await log_file.write(chunk)  # your own consumption
+       captured = capturing.capture
+       if captured.truncated:
+           print(f"discarded {captured.discarded_bytes} bytes")
+
+    When *limit* is None (the default), every byte is retained, exactly
+    like collecting without a limit; the accounting is still available
+    through :attr:`capture`.
+
+    Args:
+      stream: The `~trio.abc.ReceiveStream` to wrap. Like other stream
+          wrappers, this object takes ownership of it: closing the
+          wrapper also closes *stream*.
+      limit: An `OutputLimit`, a positive integer (shorthand for
+          ``OutputLimit(limit)`` with the default overflow policy), or
+          ``None`` for unbounded collection.
+
+    """
+
+    def __init__(
+        self,
+        stream: ReceiveStream,
+        *,
+        limit: int | OutputLimit | None = None,
+    ) -> None:
+        self._stream = stream
+        self._buffer = _OutputBuffer(_coerce_output_limit(limit, "limit"))
+
+    async def receive_some(
+        self,
+        max_bytes: int | None = None,
+    ) -> bytes | bytearray:
+        chunk = await self._stream.receive_some(max_bytes)
+        if chunk:
+            self._buffer.add(chunk)
+        return chunk
+
+    async def aclose(self) -> None:
+        await self._stream.aclose()
+
+    @property
+    def capture(self) -> CapturedOutput:
+        """A snapshot of everything accounted for so far."""
+        return self._buffer.result()
 
 
 @final
@@ -469,6 +808,8 @@ async def _run_process(
     stdin: bytes | bytearray | memoryview | int | HasFileno | None = b"",
     capture_stdout: bool = False,
     capture_stderr: bool = False,
+    stdout_limit: int | OutputLimit | None = None,
+    stderr_limit: int | OutputLimit | None = None,
     check: bool = True,
     deliver_cancel: Callable[[Process], Awaitable[object]] | None = None,
     task_status: TaskStatus[Process] = trio.TASK_STATUS_IGNORED,
@@ -530,6 +871,27 @@ async def _run_process(
     output will be available in the `~subprocess.CompletedProcess.stdout`
     attribute.
 
+    **Output limits:** Captured output is held in memory, so a process
+    that runs for a long time while emitting output continuously can
+    grow it without bound. To cap this, pass an `OutputLimit` (or a
+    bare integer, which is shorthand for ``OutputLimit(n)``) as
+    ``stdout_limit`` and/or ``stderr_limit``; passing a limit also
+    captures that stream, just like ``capture_stdout`` /
+    ``capture_stderr``. The two streams are limited independently;
+    with merged output (``stderr=subprocess.STDOUT``), the single
+    ``stdout_limit`` applies to the combined total.
+
+    Once the bound is reached, Trio either truncates the stream
+    (keeping the head and discarding the rest) or keeps the head and
+    the tail, according to the `OutputLimit`. Whether truncation
+    happened and how many bytes were discarded is available on the
+    `~trio.CapturedOutput` objects attached as the
+    ``stdout_capture`` / ``stderr_capture`` attributes of the returned
+    `~subprocess.CompletedProcess` (and of the
+    `~subprocess.CalledProcessError` raised on failure). When no
+    limit is given, those attributes are still present and report
+    unbounded, untruncated collection.
+
     If you're using ``await nursery.start(trio.run_process, ...)`` and want to capture
     the subprocess's output for further processing, then use ``stdout=subprocess.PIPE``
     and then make sure to read the data out of the `Process.stdout` stream. If you want
@@ -554,6 +916,15 @@ async def _run_process(
     **Cancellation:** If cancelled, `run_process` sends a termination
     request to the subprocess, then waits for it to fully exit. The
     ``deliver_cancel`` argument lets you control how the process is terminated.
+    Output that was already captured is never thrown away: it is
+    attached to the propagating `trio.Cancelled` exception as
+    ``stdout`` / ``stderr`` (the retained bytes, possibly truncated)
+    and ``stdout_capture`` / ``stderr_capture`` (the full
+    `~trio.CapturedOutput` accounting). This also covers timeouts:
+    with `fail_after` / `fail_at` the `Cancelled` is replaced by
+    `TooSlowError` at the timeout scope, so if you need the partial
+    output there, catch `trio.Cancelled` while it passes through that
+    scope and copy the attributes off before re-raising.
 
     .. note:: `run_process` is intentionally similar to the standard library
        `subprocess.run`, but some of the defaults are different. Specifically, we
@@ -597,6 +968,17 @@ async def _run_process(
           writes to its standard error stream and return them in the
           `~subprocess.CompletedProcess.stderr` attribute of the returned
           `~subprocess.CompletedProcess` or `subprocess.CalledProcessError`.
+
+      stdout_limit (int or OutputLimit): If given, capture standard output
+          (as with ``capture_stdout=True``) but retain at most this many
+          bytes, truncating or keeping head and tail per the
+          `OutputLimit`. Truncation information is returned on the
+          ``stdout_capture`` attribute. A bare integer means
+          ``OutputLimit(n)`` with the default overflow policy.
+
+      stderr_limit (int or OutputLimit): Like *stdout_limit*, but for
+          standard error. May not be combined with
+          ``stderr=subprocess.STDOUT``, since that merges the streams.
 
       check (bool): If false, don't validate that the subprocess exits
           successfully. You should be sure to check the
@@ -699,14 +1081,26 @@ async def _run_process(
         input_ = None
         options["stdin"] = stdin
 
-    if capture_stdout:
-        if "stdout" in options:
-            raise ValueError("can't specify both stdout and capture_stdout")
+    stdout_limit_obj = _coerce_output_limit(stdout_limit, "stdout_limit")
+    stderr_limit_obj = _coerce_output_limit(stderr_limit, "stderr_limit")
+
+    # capture flags and limits both ask for a pipe; they are mutually
+    # compatible with each other, but not with an explicit redirection.
+    if capture_stdout and "stdout" in options:
+        raise ValueError("can't specify both stdout and capture_stdout")
+    if capture_stderr and "stderr" in options:
+        raise ValueError("can't specify both stderr and capture_stderr")
+    if stdout_limit_obj is not None and "stdout" in options:
+        raise ValueError("can't specify both stdout and stdout_limit")
+    if stderr_limit_obj is not None and "stderr" in options:
+        raise ValueError("can't specify both stderr and stderr_limit")
+
+    if capture_stdout or stdout_limit_obj is not None:
         options["stdout"] = subprocess.PIPE
-    if capture_stderr:
-        if "stderr" in options:
-            raise ValueError("can't specify both stderr and capture_stderr")
+        capture_stdout = True
+    if capture_stderr or stderr_limit_obj is not None:
         options["stderr"] = subprocess.PIPE
+        capture_stderr = True
 
     if deliver_cancel is None:
         if os.name == "nt":
@@ -714,9 +1108,6 @@ async def _run_process(
         else:
             assert os.name == "posix"
             deliver_cancel = _posix_deliver_cancel
-
-    stdout_chunks: list[bytes | bytearray] = []
-    stderr_chunks: list[bytes | bytearray] = []
 
     async def feed_input(stream: SendStream) -> None:
         async with stream:
@@ -726,61 +1117,139 @@ async def _run_process(
             except trio.BrokenResourceError:
                 pass
 
-    async def read_output(
-        stream: ReceiveStream,
-        chunks: list[bytes | bytearray],
-    ) -> None:
-        async with stream:
-            async for chunk in stream:
-                chunks.append(chunk)  # noqa: PERF401
+    # Output always flows through CapturingReceiveStream/_OutputBuffer,
+    # the same accounting used by callers who hold the Process handle
+    # themselves; with no declared limit it is a no-op that retains
+    # everything.
+    stdout_capture_stream: CapturingReceiveStream | None = None
+    stderr_capture_stream: CapturingReceiveStream | None = None
 
-    # Opening the process does not need to be inside the nursery, so we put it outside
-    # so any exceptions get directly seen by users.
-    proc = await _open_process(command, **options)  # type: ignore[arg-type]
-    async with trio.open_nursery() as nursery:
-        try:
-            if input_ is not None:
-                assert proc.stdin is not None
-                nursery.start_soon(feed_input, proc.stdin)
-                proc.stdin = None
-                proc.stdio = None
-            if capture_stdout:
-                assert proc.stdout is not None
-                nursery.start_soon(read_output, proc.stdout, stdout_chunks)
-                proc.stdout = None
-                proc.stdio = None
-            if capture_stderr:
-                assert proc.stderr is not None
-                nursery.start_soon(read_output, proc.stderr, stderr_chunks)
-                proc.stderr = None
-            task_status.started(proc)
-            await proc.wait()
-        except BaseException:
-            with trio.CancelScope(shield=True):
-                killer_cscope = trio.CancelScope(shield=True)
+    async def drain_output(capture_stream: CapturingReceiveStream) -> None:
+        # Shielded so that on cancellation we still read until the
+        # (about to be killed) child exits and the pipe reaches EOF,
+        # accounting for everything it emitted before dying.
+        with trio.CancelScope(shield=True):
+            async with capture_stream:
+                async for _chunk in capture_stream:
+                    pass
 
-                async def killer() -> None:
-                    with killer_cscope:
-                        await deliver_cancel(proc)
-
-                nursery.start_soon(killer)
+    try:
+        # Opening the process does not need to be inside the nursery, so we
+        # put it outside so any exceptions get directly seen by users. It
+        # still sits inside this try block so early cancellation (which can
+        # land at the spawn checkpoint) gets the same output attributes.
+        proc = await _open_process(command, **options)  # type: ignore[arg-type]
+        async with trio.open_nursery() as nursery:
+            try:
+                if input_ is not None:
+                    assert proc.stdin is not None
+                    nursery.start_soon(feed_input, proc.stdin)
+                    proc.stdin = None
+                    proc.stdio = None
+                if capture_stdout:
+                    assert proc.stdout is not None
+                    stdout_capture_stream = CapturingReceiveStream(
+                        proc.stdout,
+                        limit=stdout_limit_obj,
+                    )
+                    nursery.start_soon(drain_output, stdout_capture_stream)
+                    proc.stdout = None
+                    proc.stdio = None
+                if capture_stderr:
+                    assert proc.stderr is not None
+                    stderr_capture_stream = CapturingReceiveStream(
+                        proc.stderr,
+                        limit=stderr_limit_obj,
+                    )
+                    nursery.start_soon(drain_output, stderr_capture_stream)
+                    proc.stderr = None
+                task_status.started(proc)
                 await proc.wait()
-                killer_cscope.cancel(reason="trio internal implementation detail")
-                raise
+            except BaseException:
+                with trio.CancelScope(shield=True):
+                    killer_cscope = trio.CancelScope(shield=True)
 
-    stdout = b"".join(stdout_chunks) if capture_stdout else None
-    stderr = b"".join(stderr_chunks) if capture_stderr else None
+                    async def killer() -> None:
+                        with killer_cscope:
+                            await deliver_cancel(proc)
+
+                    nursery.start_soon(killer)
+                    await proc.wait()
+                    killer_cscope.cancel(reason="trio internal implementation detail")
+                    raise
+    except BaseException as exc:
+        # The nursery has finished tearing down here, so the capture
+        # streams have seen EOF and their accounting is complete. Hand
+        # over whatever was collected along with the exception instead
+        # of dropping it (cancellation, timeout, I/O errors, ...).
+        _attach_captured_output(
+            exc,
+            _captured_output(stdout_capture_stream),
+            _captured_output(stderr_capture_stream),
+        )
+        raise
+
+    stdout_capture = _captured_output(stdout_capture_stream)
+    stderr_capture = _captured_output(stderr_capture_stream)
+    stdout = stdout_capture.data if stdout_capture is not None else None
+    stderr = stderr_capture.data if stderr_capture is not None else None
 
     if proc.returncode and check:
-        raise subprocess.CalledProcessError(
+        err = subprocess.CalledProcessError(
             proc.returncode,
             proc.args,
             output=stdout,
             stderr=stderr,
         )
+        _attach_captured_output(err, stdout_capture, stderr_capture)
+        raise err
     else:
         assert proc.returncode is not None
-        return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(
+            proc.args,
+            proc.returncode,
+            stdout,
+            stderr,
+        )
+        _attach_captured_output(result, stdout_capture, stderr_capture)
+        return result
+
+
+def _captured_output(
+    capture_stream: CapturingReceiveStream | None,
+) -> CapturedOutput | None:
+    if capture_stream is None:
+        return None
+    return capture_stream.capture
+
+
+def _attach_captured_output(
+    exc: object,
+    stdout_capture: CapturedOutput | None,
+    stderr_capture: CapturedOutput | None,
+) -> None:
+    # Attach the collected output to whatever is propagating: a bare
+    # Cancelled (cancellation/timeout), I/O errors, or the exception
+    # groups nurseries build out of these -- recursively, so the output
+    # is readable no matter which member a caller ends up handling. The
+    # carriers are stdlib objects (CompletedProcess/CalledProcessError/
+    # Cancelled), whose type stubs don't declare these attributes, so
+    # we attach them dynamically.
+    attributes: dict[str, bytes | CapturedOutput | None] = {
+        "stdout_capture": stdout_capture,
+        "stderr_capture": stderr_capture,
+        "stdout": None if stdout_capture is None else stdout_capture.data,
+        "stderr": None if stderr_capture is None else stderr_capture.data,
+    }
+
+    def annotate(carrier: object) -> None:
+        for name, value in attributes.items():
+            setattr(carrier, name, value)
+        if isinstance(carrier, BaseExceptionGroup):
+            for nested in carrier.exceptions:
+                annotate(nested)
+
+    annotate(exc)
 
 
 # There's a lot of duplication here because type checkers don't
@@ -886,6 +1355,8 @@ if TYPE_CHECKING:
             stdin: bytes | bytearray | memoryview | int | HasFileno | None = None,
             capture_stdout: bool = False,
             capture_stderr: bool = False,
+            stdout_limit: int | OutputLimit | None = None,
+            stderr_limit: int | OutputLimit | None = None,
             check: bool = True,
             deliver_cancel: Callable[[Process], Awaitable[object]] | None = None,
             **kwargs: Unpack[WindowsProcessArgs],
@@ -1014,6 +1485,17 @@ if TYPE_CHECKING:
                   `~subprocess.CompletedProcess.stderr` attribute of the returned
                   `~subprocess.CompletedProcess` or `subprocess.CalledProcessError`.
 
+              stdout_limit (int or OutputLimit): If given, capture standard output
+                  (as with ``capture_stdout=True``) but retain at most this many
+                  bytes, truncating or keeping head and tail per the
+                  `OutputLimit`. Truncation information is returned on the
+                  ``stdout_capture`` attribute. A bare integer means
+                  ``OutputLimit(n)`` with the default overflow policy.
+
+              stderr_limit (int or OutputLimit): Like *stdout_limit*, but for
+                  standard error. May not be combined with
+                  ``stderr=subprocess.STDOUT``, since that merges the streams.
+
               check (bool): If false, don't validate that the subprocess exits
                   successfully. You should be sure to check the
                   ``returncode`` attribute of the returned object if you pass
@@ -1116,6 +1598,8 @@ if TYPE_CHECKING:
             task_status: TaskStatus[Process]
             capture_stdout: bool
             capture_stderr: bool
+            stdout_limit: int | OutputLimit | None
+            stderr_limit: int | OutputLimit | None
             check: bool
             deliver_cancel: Callable[[Process], Awaitable[None]] | None
 

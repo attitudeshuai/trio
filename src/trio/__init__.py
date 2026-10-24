@@ -81,7 +81,13 @@ from ._ssl import (
     SSLListener as SSLListener,
     SSLStream as SSLStream,
 )
-from ._subprocess import Process as Process, run_process as run_process
+from ._subprocess import (
+    CapturedOutput as CapturedOutput,
+    CapturingReceiveStream as CapturingReceiveStream,
+    OutputLimit as OutputLimit,
+    Process as Process,
+    run_process as run_process,
+)
 from ._sync import (
     CapacityLimiter as CapacityLimiter,
     CapacityLimiterStatistics as CapacityLimiterStatistics,
