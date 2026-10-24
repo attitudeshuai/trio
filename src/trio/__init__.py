@@ -105,6 +105,16 @@ from ._timeouts import (
     sleep_until as sleep_until,
 )
 from ._version import __version__ as __version__
+from ._write_pipeline import (
+    ContentWriteError as ContentWriteError,
+    FlushError as FlushError,
+    ReplaceError as ReplaceError,
+    TempFileCreateError as TempFileCreateError,
+    WriteConflict as WriteConflict,
+    WriteConflictError as WriteConflictError,
+    WriteError as WriteError,
+    WriteStrength as WriteStrength,
+)
 
 # Not imported by default, but mentioned here so static analysis tools like
 # pylint will know that it exists.

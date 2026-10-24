@@ -14,11 +14,19 @@ from typing import (
     Concatenate,
     Literal,
     TypeVar,
+    cast,
     overload,
 )
 
-from trio._file_io import AsyncIOWrapper, wrap_file
+from trio._file_io import AsyncIOWrapper, open_file
 from trio._util import final
+from trio._write_pipeline import (
+    WriteConflict,
+    WriteStrength,
+    move as _pipeline_move,
+    touch as _pipeline_touch,
+    write_whole as _write_whole,
+)
 from trio.to_thread import run_sync
 
 if TYPE_CHECKING:
@@ -150,6 +158,9 @@ class Path(pathlib.PurePath):
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[TextIOWrapper]: ...
 
     @overload
@@ -160,6 +171,9 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[FileIO]: ...
 
     @overload
@@ -170,6 +184,9 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[BufferedRandom]: ...
 
     @overload
@@ -180,6 +197,9 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[BufferedWriter]: ...
 
     @overload
@@ -190,6 +210,9 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[BufferedReader]: ...
 
     @overload
@@ -200,6 +223,9 @@ class Path(pathlib.PurePath):
         encoding: None = None,
         errors: None = None,
         newline: None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[BinaryIO]: ...
 
     @overload
@@ -210,11 +236,37 @@ class Path(pathlib.PurePath):
         encoding: str | None = None,
         errors: str | None = None,
         newline: str | None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
     ) -> AsyncIOWrapper[IO[Any]]: ...
 
-    @_wraps_async(pathlib.Path.open)
-    def open(self, *args: Any, **kwargs: Any) -> AsyncIOWrapper[IO[Any]]:  # type: ignore[misc, explicit-any]  # Overload return mismatch.
-        return wrap_file(self._wrapped_cls(self).open(*args, **kwargs))
+    async def open(  # type: ignore[explicit-any]  # *args/**kwargs mirror open().
+        self,
+        *args: Any,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
+        **kwargs: Any,
+    ) -> AsyncIOWrapper[IO[Any]]:
+        """Like :meth:`pathlib.Path.open`, but async.
+
+        When *strength* is given, the open goes through Trio's write
+        pipeline: writes land in a same-directory staging file and are
+        atomically published to this path when the returned file object is
+        closed.  See :func:`trio.open_file` and :class:`WriteStrength` for
+        details.
+        """
+
+        return cast(  # type: ignore[explicit-any]  # mirrors builtins.open().
+            "AsyncIOWrapper[IO[Any]]",
+            await open_file(
+                self._wrapped_cls(self),
+                *args,
+                strength=strength,
+                conflict=conflict,
+                **kwargs,
+            ),
+        )
 
     def __repr__(self) -> str:
         return f"trio.Path({str(self)!r})"
@@ -243,21 +295,147 @@ class Path(pathlib.PurePath):
     if sys.platform != "win32" or sys.version_info >= (3, 12):
         is_mount = _wrap_method(pathlib.Path.is_mount)
     readlink = _wrap_method_path(pathlib.Path.readlink)
-    rename = _wrap_method_path(pathlib.Path.rename)
-    replace = _wrap_method_path(pathlib.Path.replace)
+
+    async def rename(
+        self: Self,
+        target: str | os.PathLike[str],
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
+    ) -> Self:
+        """Like :meth:`pathlib.Path.rename`, but async.
+
+        With *strength* declared, the rename runs through Trio's write
+        pipeline: concurrent writers of the destination are serialised per
+        *conflict*, failures are classified as :class:`ReplaceError`, and
+        :attr:`WriteStrength.DURABLE` also flushes the affected directory
+        entries.
+        """
+
+        result = await _pipeline_move(
+            self,
+            target,
+            overwrite=False,
+            strength=strength,
+            conflict=conflict,
+        )
+        return self.__class__(result)
+
+    async def replace(
+        self: Self,
+        target: str | os.PathLike[str],
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
+    ) -> Self:
+        """Like :meth:`pathlib.Path.replace`, but async.
+
+        With *strength* declared, the replace runs through Trio's write
+        pipeline: concurrent writers of the destination are serialised per
+        *conflict*, failures are classified as :class:`ReplaceError`, and
+        :attr:`WriteStrength.DURABLE` also flushes the affected directory
+        entries.
+        """
+
+        result = await _pipeline_move(
+            self,
+            target,
+            overwrite=True,
+            strength=strength,
+            conflict=conflict,
+        )
+        return self.__class__(result)
+
     resolve = _wrap_method_path(pathlib.Path.resolve)
     rmdir = _wrap_method(pathlib.Path.rmdir)
     symlink_to = _wrap_method(pathlib.Path.symlink_to)
     hardlink_to = _wrap_method(pathlib.Path.hardlink_to)
-    touch = _wrap_method(pathlib.Path.touch)
+
+    async def touch(
+        self,
+        mode: int = 0o666,
+        exist_ok: bool = True,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
+    ) -> None:
+        """Like :meth:`pathlib.Path.touch`, but async.
+
+        With *strength* declared, an empty staging file is created and
+        atomically published over this path, instead of creating or
+        truncating the path in place.
+        """
+
+        await _pipeline_touch(
+            self,
+            mode=mode,
+            exist_ok=exist_ok,
+            strength=strength,
+            conflict=conflict,
+        )
+
     unlink = _wrap_method(pathlib.Path.unlink)
     absolute = _wrap_method_path(pathlib.Path.absolute)
     expanduser = _wrap_method_path(pathlib.Path.expanduser)
     read_bytes = _wrap_method(pathlib.Path.read_bytes)
     read_text = _wrap_method(pathlib.Path.read_text)
     samefile = _wrap_method(pathlib.Path.samefile)
-    write_bytes = _wrap_method(pathlib.Path.write_bytes)
-    write_text = _wrap_method(pathlib.Path.write_text)
+
+    async def write_bytes(
+        self,
+        data: bytes,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
+    ) -> None:
+        """Like :meth:`pathlib.Path.write_bytes`, but async.
+
+        With *strength* declared, *data* is written to a same-directory
+        staging file and atomically published over this path when complete,
+        instead of truncating the path in place.  Concurrent writes to the
+        same path follow *conflict*.
+        """
+
+        await _write_whole(
+            self,
+            data,
+            text=False,
+            encoding=None,
+            errors=None,
+            newline=None,
+            strength=strength,
+            conflict=conflict,
+        )
+
+    async def write_text(
+        self,
+        data: str,
+        encoding: str | None = None,
+        errors: str | None = None,
+        newline: str | None = None,
+        *,
+        strength: WriteStrength | None = None,
+        conflict: WriteConflict = WriteConflict.WAIT,
+    ) -> None:
+        """Like :meth:`pathlib.Path.write_text`, but async.
+
+        With *strength* declared, *data* is written to a same-directory
+        staging file and atomically published over this path when complete,
+        instead of truncating the path in place.  Concurrent writes to the
+        same path follow *conflict*.
+        """
+
+        await _write_whole(
+            self,
+            data,
+            text=True,
+            encoding=encoding,
+            errors=errors,
+            newline=newline,
+            strength=strength,
+            conflict=conflict,
+        )
+
     if sys.version_info < (3, 12):
         link_to = _wrap_method(pathlib.Path.link_to)
     if sys.version_info >= (3, 13):

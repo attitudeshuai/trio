@@ -723,6 +723,84 @@ Asynchronous file objects
       The underlying synchronous file object.
 
 
+.. _write-pipeline:
+
+The write pipeline: atomic and crash-safe writes
+-------------------------------------------------
+
+A truncating write that is interrupted halfway through -- because the
+process is killed, the power fails, or the disk fills up -- leaves a file
+that is neither the old content nor the new content, and concurrent
+readers can observe half-written data. Trio's write surface therefore
+runs through a single write pipeline that you can configure per call via
+two keyword arguments:
+
+* ``strength`` selects how strongly the write is persisted, using the
+  :class:`WriteStrength` enum:
+
+  * :attr:`~WriteStrength.ATOMIC` writes to a unique staging file in the
+    target's own directory and, once everything is written, publishes it
+    over the target with a single atomic ``os.replace``. Readers always
+    see either the complete old file or the complete new file. No extra
+    disk flushes are forced, so this is cheap but does not guarantee
+    survival across a power loss.
+
+  * :attr:`~WriteStrength.DURABLE` additionally flushes the staging
+    file's contents (``fsync``) and the containing directory entry
+    before the replacement completes, so the new content is still
+    visible after a crash or power loss. (On Windows, directory
+    flushing is unavailable; ``os.replace`` is already atomic and
+    metadata is journalled by NTFS.)
+
+* ``conflict`` selects what happens when another writer is already
+  committed to the same target, using the :class:`WriteConflict` enum:
+  :attr:`~WriteConflict.WAIT` (the default) serialises the writers, both
+  between Trio tasks and between processes; :attr:`~WriteConflict.FAIL`
+  makes the late writer raise :class:`WriteConflictError` instead of
+  silently overwriting.
+
+The pipeline is used by :meth:`Path.write_bytes`,
+:meth:`Path.write_text`, :meth:`Path.touch`, :meth:`Path.rename`,
+:meth:`Path.replace`, :meth:`Path.open`, and :func:`open_file`. For
+:func:`open_file`/``Path.open`` a strength is only valid with pure write
+modes (``w``/``x``, text or binary): writes accumulate in the staging
+file and are published when the asynchronous file object is closed -- or
+discarded, leaving the target untouched, if closing happens while
+cancellation is pending or a write/flush failed. Subprocess output can
+be redirected to a path through the same pipeline by passing the path as
+``stdout``/``stderr`` and setting ``redirect_strength``.
+
+Each failure stage has its own exception type, all of which are
+:exc:`OSError` subclasses (so existing ``except OSError`` handlers keep
+working):
+
+.. autoclass:: WriteStrength
+   :members:
+   :undoc-members:
+
+.. autoclass:: WriteConflict
+   :members:
+   :undoc-members:
+
+.. autoexception:: WriteError
+   :members: stage
+
+.. autoexception:: TempFileCreateError
+
+.. autoexception:: ContentWriteError
+
+.. autoexception:: FlushError
+
+.. autoexception:: ReplaceError
+
+.. autoexception:: WriteConflictError
+
+When ``strength`` is not declared (or is :attr:`WriteStrength.DIRECT`),
+all of these operations keep their previous in-place truncation
+semantics, return types and exception types, and the read paths are
+unchanged.
+
+
 .. _subprocess:
 
 Spawning subprocesses

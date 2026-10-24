@@ -19,6 +19,16 @@ from typing import (
 import trio
 
 from ._util import async_wraps
+from ._write_pipeline import (
+    AtomicFileState,
+    WriteConflict,
+    WriteStrength,
+    _coerce_conflict,
+    _coerce_strength,
+    finalize_atomic_file,
+    install_write_guards,
+    open_atomic,
+)
 from .abc import AsyncResource
 
 if TYPE_CHECKING:
@@ -227,6 +237,8 @@ class AsyncIOWrapper(AsyncResource, Generic[FileT_co]):
 
     def __init__(self, file: FileT_co) -> None:
         self._wrapped = file
+        # Set by open_file() when a write strength was declared.
+        self._atomic_state: AtomicFileState | None = None
 
     @property
     def wrapped(self) -> FileT_co:
@@ -289,7 +301,18 @@ class AsyncIOWrapper(AsyncResource, Generic[FileT_co]):
         This is also shielded from cancellation; if a cancellation scope is
         cancelled, the wrapped file object will still be safely closed.
 
+        If the file was opened with a declared :class:`WriteStrength`, then
+        closing flushes the same-directory staging file and publishes it to
+        the target with one atomic replace -- or, when the write failed or
+        was cancelled, discards the staging file and leaves the target
+        untouched.
+
         """
+
+        atomic_state = self._atomic_state
+        if atomic_state is not None:
+            await finalize_atomic_file(atomic_state)
+            return
 
         # ensure the underling file is closed during cancellation
         with trio.CancelScope(shield=True):
@@ -359,6 +382,9 @@ async def open_file(
     newline: str | None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[io.TextIOWrapper]: ...
 
 
@@ -372,6 +398,9 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[io.FileIO]: ...
 
 
@@ -385,6 +414,9 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[io.BufferedRandom]: ...
 
 
@@ -398,6 +430,9 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[io.BufferedWriter]: ...
 
 
@@ -411,6 +446,9 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[io.BufferedReader]: ...
 
 
@@ -424,6 +462,9 @@ async def open_file(
     newline: None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[BinaryIO]: ...
 
 
@@ -437,6 +478,9 @@ async def open_file(  # type: ignore[explicit-any]  # Any usage matches builtins
     newline: str | None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[IO[Any]]: ...
 
 
@@ -449,6 +493,9 @@ async def open_file(
     newline: str | None = None,
     closefd: bool = True,
     opener: _Opener | None = None,
+    *,
+    strength: WriteStrength | None = None,
+    conflict: WriteConflict = WriteConflict.WAIT,
 ) -> AsyncIOWrapper[object]:
     """Asynchronous version of :func:`open`.
 
@@ -463,10 +510,48 @@ async def open_file(
 
         assert f.closed
 
+    By default (``strength=None``) this has exactly the same semantics as
+    :func:`open`, truncating the target in place.  Passing a
+    :class:`WriteStrength` reroutes the open onto Trio's write pipeline:
+    writes go to a same-directory staging file and are published to the
+    target with one atomic replace when the file is closed.
+    :attr:`~WriteStrength.ATOMIC` guarantees atomicity of the replacement;
+    :attr:`~WriteStrength.DURABLE` additionally forces the file and
+    directory data to disk.  *strength* is only valid for pure write modes
+    ``w``/``x`` (text or binary).  *conflict* selects between waiting for a
+    concurrent writer of the same target (:attr:`WriteConflict.WAIT`) or
+    failing immediately with :class:`WriteConflictError`
+    (:attr:`WriteConflict.FAIL`).
+
     See also:
       :func:`trio.Path.open`
 
     """
+    strength = _coerce_strength(strength)
+    conflict = _coerce_conflict(conflict)
+    if strength is not None and strength is not WriteStrength.DIRECT:
+        if isinstance(file, int):
+            raise ValueError(
+                "a write strength cannot be combined with opening a file "
+                "descriptor: pass a filesystem path so the staging file can "
+                "be created in the same directory",
+            )
+        sync_file, atomic_state = await open_atomic(
+            file,
+            mode,
+            buffering,
+            encoding,
+            errors,
+            newline,
+            opener,
+            strength=strength,
+            conflict=conflict,
+        )
+        atomic_file = wrap_file(sync_file)
+        atomic_file._atomic_state = atomic_state
+        install_write_guards(atomic_file, atomic_state)
+        return atomic_file
+
     file_ = wrap_file(
         await trio.to_thread.run_sync(
             io.open,

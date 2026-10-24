@@ -1,0 +1,14 @@
+The filesystem write surface (``trio.Path.write_bytes``,
+``write_text``, ``touch``, ``rename``, ``replace``, ``trio.Path.open`` and
+``trio.open_file``, as well as subprocess output redirected to a path) now
+runs through a single, declarable write pipeline. Pass ``strength=`` with
+``trio.WriteStrength.ATOMIC`` to stage writes in a same-directory temporary
+file and publish them with one atomic replace, or
+``trio.WriteStrength.DURABLE`` to additionally force file and directory
+data to disk. Failures are classified by stage
+(``trio.TempFileCreateError``, ``trio.ContentWriteError``,
+``trio.FlushError``, ``trio.ReplaceError``), concurrent writers are
+serialised per target or rejected with ``trio.WriteConflictError`` via
+``conflict=trio.WriteConflict.FAIL``, and cancellation or failure cleans up
+staging files and leaves the target untouched. Default behaviour is
+unchanged when no strength is declared.

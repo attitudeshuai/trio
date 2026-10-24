@@ -28,6 +28,14 @@ from ._subprocess_platform import (
 )
 from ._sync import Lock
 from ._util import NoPublicConstructor, final
+from ._write_pipeline import (
+    OutputRedirect,
+    WriteConflict,
+    WriteStrength,
+    finalize_redirects,
+    is_path_like,
+    redirect_output,
+)
 
 if TYPE_CHECKING:
     import signal
@@ -161,11 +169,20 @@ class Process(metaclass=NoPublicConstructor):
         stdin: SendStream | None,
         stdout: ReceiveStream | None,
         stderr: ReceiveStream | None,
+        redirects: list[OutputRedirect] | None = None,
     ) -> None:
         self._proc = popen
         self.stdin = stdin
         self.stdout = stdout
         self.stderr = stderr
+
+        # Output streams that were redirected onto write-pipeline staging
+        # files; they are published (or discarded) once the child exits.
+        self._redirects: list[OutputRedirect] = (
+            list(redirects) if redirects is not None else []
+        )
+        self._redirects_finalized = False
+        self._abandon_redirects = False
 
         self.stdio: StapledStream[SendStream, ReceiveStream] | None = None
         if self.stdin is not None and self.stdout is not None:
@@ -223,6 +240,7 @@ class Process(metaclass=NoPublicConstructor):
         result = self._proc.poll()
         if result is not None:
             self._close_pidfd()
+            self._finalize_redirects()
         return result
 
     def _close_pidfd(self) -> None:
@@ -230,6 +248,14 @@ class Process(metaclass=NoPublicConstructor):
             trio.lowlevel.notify_closing(self._pidfd.fileno())
             self._pidfd.close()
             self._pidfd = None
+
+    def _finalize_redirects(self) -> None:
+        """Publish staging-file outputs to their targets, or discard them."""
+        if self._redirects_finalized or not self._redirects:
+            self._redirects_finalized = True
+            return
+        self._redirects_finalized = True
+        finalize_redirects(self._redirects, self._abandon_redirects)
 
     async def wait(self) -> int:
         """Block until the process exits.
@@ -254,6 +280,7 @@ class Process(metaclass=NoPublicConstructor):
                 # actually block for a tiny fraction of a second.
                 self._proc.wait()
                 self._close_pidfd()
+                self._finalize_redirects()
         assert self._proc.returncode is not None
         return self._proc.returncode
 
@@ -307,8 +334,10 @@ async def _open_process(
     command: StrOrBytesPath | Sequence[StrOrBytesPath],
     *,
     stdin: int | HasFileno | None = None,
-    stdout: int | HasFileno | None = None,
-    stderr: int | HasFileno | None = None,
+    stdout: int | HasFileno | StrOrBytesPath | None = None,
+    stderr: int | HasFileno | StrOrBytesPath | None = None,
+    redirect_strength: WriteStrength | str | None = None,
+    redirect_conflict: WriteConflict | str = WriteConflict.WAIT,
     **options: object,
 ) -> Process:
     r"""Execute a child program in a new process.
@@ -385,6 +414,9 @@ async def _open_process(
     trio_stdin: ClosableSendStream | None = None
     trio_stdout: ClosableReceiveStream | None = None
     trio_stderr: ClosableReceiveStream | None = None
+    # Output paths redirected through the write pipeline.  Their staging
+    # files are published to their targets once the child has exited.
+    redirects: list[OutputRedirect] = []
     # Close the parent's handle for each child side of a pipe; we want the child to
     # have the only copy, so that when it exits we can read EOF on our side. The
     # trio ends of pipes will be transferred to the Process object, which will be
@@ -395,6 +427,24 @@ async def _open_process(
             trio_stdin, stdin = create_pipe_to_child_stdin()
             always_cleanup.callback(os.close, stdin)
             cleanup_on_fail.callback(trio_stdin.close)
+
+        # A path-like stdout/stderr is routed through the write pipeline: the
+        # child writes a same-directory staging file, which is atomically
+        # published over the destination after exit (or truncated in place
+        # when no strength is declared).
+        if is_path_like(stdout):
+            stdout_fd, stdout_redirect = await redirect_output(
+                stdout,  # type: ignore[arg-type]
+                strength=redirect_strength,
+                conflict=redirect_conflict,
+            )
+            stdout = stdout_fd
+            if stdout_redirect is not None:
+                redirects.append(stdout_redirect)
+                cleanup_on_fail.callback(stdout_redirect.finalize, True)
+            else:
+                always_cleanup.callback(os.close, stdout)
+
         if stdout == subprocess.PIPE:
             trio_stdout, stdout = create_pipe_from_child_output()
             always_cleanup.callback(os.close, stdout)
@@ -409,6 +459,18 @@ async def _open_process(
             # is piped, stderr will be intermixed on the stdout stream.
             if stdout is not None:
                 stderr = stdout
+        elif is_path_like(stderr):
+            stderr_fd, stderr_redirect = await redirect_output(
+                stderr,  # type: ignore[arg-type]
+                strength=redirect_strength,
+                conflict=redirect_conflict,
+            )
+            stderr = stderr_fd
+            if stderr_redirect is not None:
+                redirects.append(stderr_redirect)
+                cleanup_on_fail.callback(stderr_redirect.finalize, True)
+            else:
+                always_cleanup.callback(os.close, stderr)
         elif stderr == subprocess.PIPE:
             trio_stderr, stderr = create_pipe_from_child_output()
             always_cleanup.callback(os.close, stderr)
@@ -427,7 +489,9 @@ async def _open_process(
         # We did not fail, so dismiss the stack for the trio ends
         cleanup_on_fail.pop_all()
 
-    return Process._create(popen, trio_stdin, trio_stdout, trio_stderr)
+    return Process._create(
+        popen, trio_stdin, trio_stdout, trio_stderr, redirects=redirects
+    )
 
 
 # async function missing await
@@ -756,6 +820,11 @@ async def _run_process(
             task_status.started(proc)
             await proc.wait()
         except BaseException:
+            # The run is unwinding (often due to cancellation): make sure
+            # partially written staging outputs are discarded instead of
+            # being published over their targets.
+            with contextlib.suppress(AttributeError):
+                proc._abandon_redirects = True
             with trio.CancelScope(shield=True):
                 killer_cscope = trio.CancelScope(shield=True)
 
@@ -803,12 +872,14 @@ async def _run_process(
 class GeneralProcessArgs(TypedDict, total=False):
     """Arguments shared between all runs."""
 
-    stdout: int | HasFileno | None
-    stderr: int | HasFileno | None
+    stdout: int | HasFileno | StrOrBytesPath | None
+    stderr: int | HasFileno | StrOrBytesPath | None
     close_fds: bool
     cwd: StrOrBytesPath | None
     env: Mapping[str, str] | None
     executable: StrOrBytesPath | None
+    redirect_strength: WriteStrength | None
+    redirect_conflict: WriteConflict
 
 
 if TYPE_CHECKING:
