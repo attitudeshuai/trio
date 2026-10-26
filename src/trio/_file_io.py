@@ -248,7 +248,10 @@ class AsyncIOWrapper(AsyncResource, Generic[FileT_co]):
                     **kwargs: object | str | bool | CapacityLimiter | None,
                 ) -> T:
                     func = partial(meth, *args, **kwargs)
-                    return await trio.to_thread.run_sync(func)
+                    return await trio.to_thread.run_sync(
+                        func,
+                        source=f"trio.file_io.{name}",
+                    )
 
                 # cache the generated method
                 setattr(self, name, wrapper)
@@ -280,7 +283,10 @@ class AsyncIOWrapper(AsyncResource, Generic[FileT_co]):
 
         """
 
-        raw = await trio.to_thread.run_sync(self._wrapped.detach)
+        raw = await trio.to_thread.run_sync(
+            self._wrapped.detach,
+            source="trio.file_io.detach",
+        )
         return wrap_file(raw)
 
     async def aclose(self: AsyncIOWrapper[_CanClose]) -> None:
@@ -293,7 +299,10 @@ class AsyncIOWrapper(AsyncResource, Generic[FileT_co]):
 
         # ensure the underling file is closed during cancellation
         with trio.CancelScope(shield=True):
-            await trio.to_thread.run_sync(self._wrapped.close)
+            await trio.to_thread.run_sync(
+                self._wrapped.close,
+                source="trio.file_io.close",
+            )
 
         await trio.lowlevel.checkpoint_if_cancelled()
 
@@ -478,6 +487,7 @@ async def open_file(
             newline,
             closefd,
             opener,
+            source="trio.open_file",
         ),
     )
     return file_

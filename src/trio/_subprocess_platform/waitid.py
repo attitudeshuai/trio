@@ -1,11 +1,10 @@
 import errno
-import math
 import os
 import sys
 from typing import TYPE_CHECKING
 
 from .. import _core, _subprocess
-from .._sync import CapacityLimiter, Event
+from .._sync import Event
 from .._threads import to_thread_run_sync
 
 assert (sys.platform != "win32" and sys.platform != "darwin") or not TYPE_CHECKING
@@ -65,7 +64,10 @@ int waitid(int idtype, int id, siginfo_t* result, int options);
 # adapted from
 # https://github.com/python-trio/trio/issues/4#issuecomment-398967572
 
-waitid_limiter = CapacityLimiter(math.inf)
+# Source tag used on the shared thread boundary; statistics and fair
+# scheduling can thus distinguish child-reaping waits from file I/O and
+# user submissions.
+_WAITID_SOURCE = "trio.subprocess.wait_child_exiting"
 
 
 async def _waitid_system_task(pid: int, event: Event) -> None:
@@ -82,7 +84,7 @@ async def _waitid_system_task(pid: int, event: Event) -> None:
             sync_wait_reapable,
             pid,
             abandon_on_cancel=True,
-            limiter=waitid_limiter,
+            source=_WAITID_SOURCE,
         )
     except OSError:
         # If waitid fails, waitpid will fail too, so it still makes

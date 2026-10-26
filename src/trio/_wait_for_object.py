@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-
 import trio
 
 from ._core._windows_cffi import (
@@ -46,7 +44,7 @@ async def WaitForSingleObject(obj: int | CData) -> None:
             handle,
             cancel_handle,
             abandon_on_cancel=True,
-            limiter=trio.CapacityLimiter(math.inf),
+            source="trio.lowlevel.WaitForSingleObject",
         )
     finally:
         # Clean up our cancel handle. In case we get here because this task was

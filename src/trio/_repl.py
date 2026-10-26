@@ -131,7 +131,11 @@ async def run_repl(console: TrioInteractiveConsole) -> None:
         f'{getattr(sys, "ps1", ">>> ")}import trio'
     )
     try:
-        await trio.to_thread.run_sync(console.interact, banner)
+        await trio.to_thread.run_sync(
+            console.interact,
+            banner,
+            source="trio.lowlevel.run_repl",
+        )
     finally:
         warnings.filterwarnings(
             "ignore",

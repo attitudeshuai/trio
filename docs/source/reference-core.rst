@@ -1925,6 +1925,37 @@ Putting blocking I/O into worker threads
 
 .. autofunction:: trio.to_thread.current_default_thread_limiter
 
+The execution boundary
+~~~~~~~~~~~~~~~~~~~~~~
+
+All of Trio's in-library call sites that delegate blocking synchronous
+work to a worker thread – :func:`trio.to_thread.run_sync` itself, the
+:func:`open_file`/file wrappers, subprocess exit waiting and cleanup, and
+the others – go through one shared, declarable boundary:
+
+.. autoclass:: trio.to_thread.ThreadBoundary
+   :members:
+   :member-order: groupwise
+
+.. autoclass:: trio.to_thread.ThreadBoundaryStatistics
+   :members:
+
+.. autoclass:: trio.to_thread.SourceBoundaryStatistics
+   :members:
+
+.. autoclass:: trio.to_thread.PendingThreadWork
+   :members:
+
+.. autoclass:: trio.to_thread.ThreadBoundaryShutdown
+   :members:
+
+.. autoclass:: trio.to_thread.OverflowPolicy
+   :members:
+
+.. autoexception:: trio.to_thread.ThreadBoundaryRejected
+
+.. autoexception:: trio.to_thread.ThreadBoundaryClosed
+
 
 .. module:: trio.from_thread
 .. currentmodule:: trio

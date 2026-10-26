@@ -6,7 +6,7 @@ import inspect
 import queue as stdlib_queue
 import threading
 from itertools import count
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Generic, TypeVar, cast
 
 import attrs
 import outcome
@@ -24,6 +24,7 @@ from ._core import (
     start_thread_soon,
 )
 from ._sync import CapacityLimiter, Event
+from ._thread_boundary import ThreadBoundary
 from ._util import coroutine_or_error
 
 if TYPE_CHECKING:
@@ -50,7 +51,7 @@ class _ParentTaskData(threading.local):
 
 PARENT_TASK_DATA = _ParentTaskData()
 
-_limiter_local: RunVar[CapacityLimiter] = RunVar("limiter")
+_limiter_local: RunVar[ThreadBoundary] = RunVar("limiter")
 # I pulled this number out of the air; it isn't based on anything. Probably we
 # should make some kind of measurements to pick a good value.
 DEFAULT_LIMIT = 40
@@ -124,19 +125,28 @@ def active_thread_count() -> int:
 
 
 def current_default_thread_limiter() -> CapacityLimiter:
-    """Get the default `~trio.CapacityLimiter` used by
-    `trio.to_thread.run_sync`.
+    """Get the default execution boundary used by `trio.to_thread.run_sync`.
+
+    This is a `~trio.to_thread.ThreadBoundary` (which is API-compatible with
+    `~trio.CapacityLimiter`): every in-library place that pushes a blocking
+    synchronous call into a thread – file I/O wrappers, subprocess exit
+    waiting/cleanup and ``run_sync`` itself – funnels through this one
+    boundary.
 
     The most common reason to call this would be if you want to modify its
-    :attr:`~trio.CapacityLimiter.total_tokens` attribute.
+    :attr:`~trio.CapacityLimiter.total_tokens` attribute. You can also
+    configure its ``queue_capacity`` and ``overflow`` policy, shut it down
+    with :meth:`~trio.to_thread.ThreadBoundary.shutdown`, or read
+    :meth:`~trio.to_thread.ThreadBoundary.statistics`.
 
     """
     try:
         limiter = _limiter_local.get()
     except LookupError:
-        limiter = CapacityLimiter(DEFAULT_LIMIT)
+        limiter = ThreadBoundary(DEFAULT_LIMIT)
         _limiter_local.set(limiter)
-    return limiter
+    # ThreadBoundary is a CapacityLimiter-compatible duck type on purpose.
+    return cast(CapacityLimiter, limiter)
 
 
 # Eventually we might build this into a full-fledged deadlock-detection
@@ -259,7 +269,8 @@ async def to_thread_run_sync(
     *args: Unpack[Ts],
     thread_name: str | None = None,
     abandon_on_cancel: bool = False,
-    limiter: CapacityLimiter | None = None,
+    limiter: CapacityLimiter | ThreadBoundary | None = None,
+    source: object = None,
 ) -> RetT:
     """Convert a blocking operation into an async operation using a thread.
 
@@ -297,8 +308,19 @@ async def to_thread_run_sync(
           function will call ``acquire_on_behalf_of`` before starting the
           thread, and ``release_on_behalf_of`` after the thread has finished.
 
-          If None (the default), uses the default `~trio.CapacityLimiter`, as
-          returned by :func:`current_default_thread_limiter`.
+          If None (the default), uses the default
+          :class:`~trio.to_thread.ThreadBoundary`, as returned by
+          :func:`current_default_thread_limiter`.
+      source (object): An optional tag used by the boundary's fair queueing
+          and statistics. Items with the same source start in FIFO order,
+          while free slots are offered to different sources round-robin, so
+          one source flooding thousands of calls cannot starve the others.
+          The default boundary's
+          :meth:`~trio.to_thread.ThreadBoundary.statistics` breaks queue
+          lengths and waiting times down by this tag. It is only honored by
+          :class:`~trio.to_thread.ThreadBoundary`; an arbitrary
+          ``limiter`` object that merely follows the `~trio.CapacityLimiter`
+          acquire/release protocol ignores it.
 
     **Cancellation handling**: Cancellation is a tricky issue here, because
     neither Python nor the operating systems it runs on provide any general
@@ -342,6 +364,10 @@ async def to_thread_run_sync(
 
     Raises:
       Exception: Whatever ``sync_fn(*args)`` raises.
+      trio.to_thread.ThreadBoundaryRejected: If the boundary's capacity and
+          queue are both exhausted and its overflow policy is ``REJECT``.
+      trio.to_thread.ThreadBoundaryClosed: If the boundary has been shut
+          down (see :meth:`trio.to_thread.ThreadBoundary.shutdown`).
 
     """
     await trio.lowlevel.checkpoint_if_cancelled()
@@ -420,7 +446,18 @@ async def to_thread_run_sync(
         with contextlib.suppress(trio.RunFinishedError):
             current_trio_token.run_sync_soon(report_back_in_trio_thread_fn, result)
 
-    await limiter.acquire_on_behalf_of(placeholder)
+    if isinstance(limiter, ThreadBoundary):
+        # The unified boundary: honors queue limits, overflow policy,
+        # source tags, statistics and shutdown accounting.
+        await limiter.submit_on_behalf_of(
+            placeholder,
+            source=source,
+            work=(sync_fn, cast("tuple[object, ...]", args)),
+        )
+    else:
+        # Arbitrary user-supplied CapacityLimiter-like object; only the
+        # documented acquire/release protocol is available.
+        await limiter.acquire_on_behalf_of(placeholder)
     with _track_active_thread():
         try:
             start_thread_soon(worker_fn, deliver_worker_fn_result, thread_name)

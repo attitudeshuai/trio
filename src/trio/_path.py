@@ -45,7 +45,10 @@ def _wraps_async(  # type: ignore[explicit-any]
 ) -> Callable[[Callable[P, T]], Callable[P, Awaitable[T]]]:
     def decorator(fn: Callable[P, T]) -> Callable[P, Awaitable[T]]:
         async def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-            return await run_sync(partial(fn, *args, **kwargs))
+            return await run_sync(
+                partial(fn, *args, **kwargs),
+                source="trio.Path",
+            )
 
         update_wrapper(wrapper, wrapped)
         if wrapped.__doc__:

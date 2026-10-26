@@ -423,6 +423,7 @@ async def _open_process(
                 stderr=stderr,
                 **options,
             ),
+            source="trio.open_process",
         )
         # We did not fail, so dismiss the stack for the trio ends
         cleanup_on_fail.pop_all()

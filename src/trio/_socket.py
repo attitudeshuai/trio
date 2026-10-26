@@ -252,6 +252,7 @@ async def getaddrinfo(
             proto,
             flags,
             abandon_on_cancel=True,
+            source="trio.socket.getaddrinfo",
         )
 
 
@@ -277,6 +278,7 @@ async def getnameinfo(
             sockaddr,
             flags,
             abandon_on_cancel=True,
+            source="trio.socket.getnameinfo",
         )
 
 
@@ -290,6 +292,7 @@ async def getprotobyname(name: str) -> int:
         _stdlib_socket.getprotobyname,
         name,
         abandon_on_cancel=True,
+        source="trio.socket.getprotobyname",
     )
 
 
@@ -926,7 +929,11 @@ class _SocketType(SocketType):
         ):
             # Use a thread for the filesystem traversal (unless it's an
             # abstract domain socket)
-            return await trio.to_thread.run_sync(self._sock.bind, address)
+            return await trio.to_thread.run_sync(
+                self._sock.bind,
+                address,
+                source="trio.socket.bind",
+            )
         else:
             # POSIX actually says that bind can return EWOULDBLOCK and
             # complete asynchronously, like connect. But in practice AFAICT
